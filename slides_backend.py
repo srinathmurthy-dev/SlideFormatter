@@ -246,22 +246,32 @@ def _create_field_mask(props):
     if not isinstance(props, dict): return ""
     return ",".join(props.keys())
 
-def generate_style_update_requests(object_id, master_element):
+def generate_style_update_requests(object_id, master_element, cell_location=None):
     requests = []
+    # When processing a table cell, the cell itself is passed as the `master_element`.
     text_obj = master_element.get('text') or master_element.get('shape', {}).get('text')
     if not text_obj: return []
+
     for te in text_obj.get('textElements', []):
         text_range = {'type': 'FIXED_RANGE', 'startIndex': te.get('startIndex', 0), 'endIndex': te.get('endIndex', 1)}
+
+        # Text Style (font, color, etc.)
         if 'textRun' in te and 'style' in te['textRun']:
             style = scrub_read_only_fields(te['textRun']['style'])
             field_mask = _create_field_mask(style)
             if field_mask:
-                requests.append({'updateTextStyle': {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}})
+                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
+                if cell_location: req_body['cellLocation'] = cell_location
+                requests.append({'updateTextStyle': req_body})
+
+        # Paragraph Style (alignment, etc.)
         if 'paragraphMarker' in te and 'style' in te['paragraphMarker']:
             style = scrub_read_only_fields(te['paragraphMarker']['style'])
             field_mask = _create_field_mask(style)
             if field_mask:
-                requests.append({'updateParagraphStyle': {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}})
+                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
+                if cell_location: req_body['cellLocation'] = cell_location
+                requests.append({'updateParagraphStyle': req_body})
     return requests
 
 # --- Main Sync Logic ---
@@ -282,24 +292,26 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         if not element_type: continue
 
         matching_id = find_master_match(me, dest_elements)
-        if matching_id: # Update
-            if element_type == 'shape' and 'shapeProperties' in me['shape']:
-                props = scrub_read_only_fields(me['shape']['shapeProperties'])
-                field_mask = _create_field_mask(props)
-                if field_mask:
-                    requests.append({'updateShapeProperties': {'objectId': matching_id, 'shapeProperties': props, 'fields': field_mask}})
-            elif element_type == 'image' and 'imageProperties' in me['image']:
-                props = scrub_read_only_fields(me['image']['imageProperties'])
-                field_mask = _create_field_mask(props)
-                if field_mask:
-                    requests.append({'updateImageProperties': {'objectId': matching_id, 'imageProperties': props, 'fields': field_mask}})
-
-            if element_type in ('shape', 'table'):
+        if matching_id: # Update existing element
+            if element_type == 'shape':
+                if 'shapeProperties' in me['shape']:
+                    props = scrub_read_only_fields(me['shape']['shapeProperties'])
+                    if (mask := _create_field_mask(props)): requests.append({'updateShapeProperties': {'objectId': matching_id, 'shapeProperties': props, 'fields': mask}})
+                # Replicate shape text
                 requests.append({'deleteText': {'objectId': matching_id, 'textRange': {'type': 'ALL'}}})
-                full_text = get_text_content_from_element(me)
-                if full_text: requests.append({'insertText': {'objectId': matching_id, 'text': full_text}})
+                if (text := get_text_content_from_element(me)): requests.append({'insertText': {'objectId': matching_id, 'text': text}})
                 requests.extend(generate_style_update_requests(matching_id, me))
-        else: # Create
+
+            elif element_type == 'image':
+                if 'imageProperties' in me['image']:
+                    props = scrub_read_only_fields(me['image']['imageProperties'])
+                    if (mask := _create_field_mask(props)): requests.append({'updateImageProperties': {'objectId': matching_id, 'imageProperties': props, 'fields': mask}})
+
+            elif element_type == 'table':
+                # Replicate table content and styles cell by cell
+                requests.extend(_replicate_table_content_requests(matching_id, me))
+
+        else: # Create new element
             new_id = uuid.uuid4().hex
             props = {'pageObjectId': dest_slide_id, 'size': me.get('size'), 'transform': me.get('transform')}
 
@@ -307,21 +319,21 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 requests.append({'createShape': {'objectId': new_id, 'shapeType': me['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': props}})
                 if 'shapeProperties' in me['shape']:
                     shape_props = scrub_read_only_fields(me['shape']['shapeProperties'])
-                    field_mask = _create_field_mask(shape_props)
-                    if field_mask:
-                        requests.append({'updateShapeProperties': {'objectId': new_id, 'shapeProperties': shape_props, 'fields': field_mask}})
+                    if (mask := _create_field_mask(shape_props)): requests.append({'updateShapeProperties': {'objectId': new_id, 'shapeProperties': shape_props, 'fields': mask}})
+                # Replicate shape text
+                if (text := get_text_content_from_element(me)): requests.append({'insertText': {'objectId': new_id, 'text': text}})
+                requests.extend(generate_style_update_requests(new_id, me))
+
             elif element_type == 'image':
                 requests.append({'createImage': {'url': me['image']['contentUrl'], 'elementProperties': props}})
                 if 'imageProperties' in me['image']:
                     image_props = scrub_read_only_fields(me['image']['imageProperties'])
-                    field_mask = _create_field_mask(image_props)
-                    if field_mask:
-                        requests.append({'updateImageProperties': {'objectId': new_id, 'imageProperties': image_props, 'fields': field_mask}})
+                    if (mask := _create_field_mask(image_props)): requests.append({'updateImageProperties': {'objectId': new_id, 'imageProperties': image_props, 'fields': mask}})
 
-            if element_type in ('shape', 'table'):
-                full_text = get_text_content_from_element(me)
-                if full_text: requests.append({'insertText': {'objectId': new_id, 'text': full_text}})
-                requests.extend(generate_style_update_requests(new_id, me))
+            elif element_type == 'table':
+                requests.append({'createTable': {'objectId': new_id, 'rows': me['table']['rows'], 'columns': me['table']['columns'], 'elementProperties': props}})
+                # Replicate table content and styles cell by cell
+                requests.extend(_replicate_table_content_requests(new_id, me))
 
     return requests
 
@@ -433,7 +445,10 @@ def run_back_end(master_url, dest_url, table_format, status_output):
         dest_slides = dest_pres.get('slides', [])
 
         for i, master_slide in enumerate(master_slides):
-            if i >= len(dest_slides): continue
+            logging.info(f"Processing Slide {i+1}/{len(master_slides)} for {dest_file['name']}")
+            if i >= len(dest_slides):
+                logging.warning(f"Skipping slide {i+1} as it does not exist in destination.")
+                continue
 
             dest_slide = dest_slides[i]
             copy_reqs = copy_slide_content(slides_service, master_slide['objectId'], master_id, dest_file['id'], dest_slide['objectId'], master_slide, drive_service, docai_client, storage_client)
@@ -452,3 +467,41 @@ def run_back_end(master_url, dest_url, table_format, status_output):
 
     logging.info("--- Run Cycle Complete ---")
     return LOG_FILENAME, 0 if total_inconsistencies == 0 else -1
+def _replicate_table_content_requests(table_id, master_table_element):
+    """
+    Generates requests to replicate the text content and style of each cell in a table.
+    This is a dedicated function to handle the cell-by-cell operations required for tables.
+    """
+    requests = []
+    table_prop = master_table_element.get('table', {})
+    rows = table_prop.get('tableRows', [])
+
+    for r_idx, row in enumerate(rows):
+        for c_idx, cell in enumerate(row.get('tableCells', [])):
+            cell_loc = {'rowIndex': r_idx, 'columnIndex': c_idx}
+
+            # 1. Clear existing content from the cell
+            requests.append({
+                'deleteText': {
+                    'objectId': table_id,
+                    'cellLocation': cell_loc,
+                    'textRange': {'type': 'ALL'}
+                }
+            })
+
+            # 2. Insert new text content into the cell
+            full_text = get_text_content_from_element(cell)
+            if full_text:
+                requests.append({
+                    'insertText': {
+                        'objectId': table_id,
+                        'cellLocation': cell_loc,
+                        'text': full_text
+                    }
+                })
+
+            # 3. Apply detailed styling to the text within the cell
+            # We pass the cell itself as the 'master_element' because it contains the 'text' object.
+            requests.extend(generate_style_update_requests(table_id, cell, cell_location=cell_loc))
+
+    return requests
