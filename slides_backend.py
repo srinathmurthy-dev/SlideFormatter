@@ -157,18 +157,25 @@ def get_slide_page_elements(slides_service, pres_id):
 def find_master_match(element1, element2_list):
     def get_metrics(element):
         size = element.get('size', {})
+        width = size.get('width', {}).get('magnitude', 0)
+        height = size.get('height', {}).get('magnitude', 0)
         transform = element.get('transform', {})
-        return (
-            round(size.get('width', {}).get('magnitude', 0), 3),
-            round(size.get('height', {}).get('magnitude', 0), 3),
-            round(transform.get('translateX', 0), 3),
-            round(transform.get('translateY', 0), 3)
-        )
-    m1 = get_metrics(element1)
-    if m1 == (0, 0, 0, 0) and not element1.get('shape'): return True
+        x_pos = transform.get('translateX', 0)
+        y_pos = transform.get('translateY', 0)
+        return (round(width, 3), round(height, 3), round(x_pos, 3), round(y_pos, 3))
+
+    w1, h1, x1, y1 = get_metrics(element1)
+    logging.debug(f"MATCH: Comparing Master ({element1.get('objectId')}) DIMS: W={w1}, H={h1}, X={x1}, Y={y1}")
+
+    if w1 == 0 and h1 == 0 and not element1.get('shape'): return True
+
     for e2 in element2_list:
-        if m1 == get_metrics(e2):
+        w2, h2, x2, y2 = get_metrics(e2)
+        logging.debug(f"MATCH:    vs Dest ({e2.get('objectId')}) DIMS: W={w2}, H={h2}, X={x2}, Y={y2}")
+        if w1 == w2 and h1 == h2 and x1 == x2 and y1 == y2:
+            logging.debug(f"MATCH:    *** EXACT MATCH FOUND *** between Master {element1.get('objectId')} and Dest {e2.get('objectId')}")
             return e2.get('objectId')
+
     return None
 
 # --- Document AI Processing ---
@@ -247,34 +254,35 @@ def _create_field_mask(props):
     return ",".join(props.keys())
 
 def generate_style_update_requests(object_id, master_element, cell_location=None):
-    """
-    Applies the dominant style from a master element to the entire text range of a destination element.
-    """
     requests = []
+    # When processing a table cell, the cell itself is passed as the `master_element`.
     text_obj = master_element.get('text') or master_element.get('shape', {}).get('text')
     if not text_obj: return []
 
-    # Define a single text range that covers all content
-    full_range = {'type': 'ALL'}
+    for te in text_obj.get('textElements', []):
+        # Only process elements that have a valid range. This prevents errors with empty paragraphs.
+        if 'startIndex' in te and 'endIndex' in te:
+            text_range = {'type': 'FIXED_RANGE', 'startIndex': te['startIndex'], 'endIndex': te['endIndex']}
+        else:
+            continue # Skip elements without a valid range
 
-    # Find the first dominant text style and apply it to the whole range
-    first_text_run_style = next((te.get('textRun', {}).get('style') for te in text_obj.get('textElements', []) if te.get('textRun')), None)
-    if first_text_run_style:
-        style = scrub_read_only_fields(first_text_run_style)
-        if (mask := _create_field_mask(style)):
-            req_body = {'objectId': object_id, 'style': style, 'textRange': full_range, 'fields': mask}
-            if cell_location: req_body['cellLocation'] = cell_location
-            requests.append({'updateTextStyle': req_body})
+        # Text Style (font, color, etc.)
+        if 'textRun' in te and 'style' in te['textRun']:
+            style = scrub_read_only_fields(te['textRun']['style'])
+            field_mask = _create_field_mask(style)
+            if field_mask:
+                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
+                if cell_location: req_body['cellLocation'] = cell_location
+                requests.append({'updateTextStyle': req_body})
 
-    # Find the first dominant paragraph style and apply it to the whole range
-    first_paragraph_style = next((te.get('paragraphMarker', {}).get('style') for te in text_obj.get('textElements', []) if te.get('paragraphMarker')), None)
-    if first_paragraph_style:
-        style = scrub_read_only_fields(first_paragraph_style)
-        if (mask := _create_field_mask(style)):
-            req_body = {'objectId': object_id, 'style': style, 'textRange': full_range, 'fields': mask}
-            if cell_location: req_body['cellLocation'] = cell_location
-            requests.append({'updateParagraphStyle': req_body})
-
+        # Paragraph Style (alignment, etc.)
+        if 'paragraphMarker' in te and 'style' in te['paragraphMarker']:
+            style = scrub_read_only_fields(te['paragraphMarker']['style'])
+            field_mask = _create_field_mask(style)
+            if field_mask:
+                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
+                if cell_location: req_body['cellLocation'] = cell_location
+                requests.append({'updateParagraphStyle': req_body})
     return requests
 
 # --- Main Sync Logic ---
@@ -286,13 +294,24 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         logging.error(f"Could not read dest slide {dest_slide_id}: {e}"); return []
 
     master_elements = master_slide_json.get('pageElements', [])
+    logging.debug(f"Phase 1: Checking {len(dest_elements)} destination elements for deletion.")
     for de in dest_elements:
         if not find_master_match(de, master_elements):
             requests.append({'deleteObject': {'objectId': de['objectId']}})
+            logging.debug(f"ACTION: DELETE object {de['objectId']} (not found in master).")
 
+    logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
     for me in master_elements:
         element_type = next((k for k in me if k not in ['objectId', 'size', 'transform']), None)
         if not element_type: continue
+
+        # OCR should be called regardless of whether the image is new or existing
+        if element_type == 'image':
+            extracted_text = process_image_ocr(me, drive_service, docai_client, storage_client, slides_service, dest_pres_id)
+            if extracted_text:
+                logging.info(f"OCR_RESULT: Found text in image {me['objectId']}. Adding for validation.")
+                keyword_metadata = process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, [{'text': {'textElements': [{'textRun': {'content': extracted_text}}]}}], table_format)
+                GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
 
         matching_id = find_master_match(me, dest_elements)
         if matching_id: # Update existing element
@@ -374,46 +393,58 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format):
                 col_keyword = col_headers[c_idx - 1]
                 logging.info(f"TABLE_INTERSECTION: Slide {dest_slide_id}. Label='{row_label}' / Keyword='{col_keyword}' / Value='{value}'")
 
-def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format):
+def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers"):
+    """Processes text for keyword/value extraction and calculates fuzzy confidence."""
     metadata = []
     VALUE_PATTERN = re.compile(r'(\([\+\-]?[\d\.,]+%\)|[\+\-]?\$?[\d\.,]+[KMT]?\s?[\(]*[\+\-]?[\d\.,]+%\)*|[\+\-]?\$?[\d\.,]+[KMT]?|\([\+\-]?[\d\.,]+%\))', re.IGNORECASE)
 
     for element in page_elements:
-        element_id = element.get('objectId', 'unknown')
-        if 'table' in element:
+        element_id = element.get('objectId', uuid.uuid4().hex)
+        element_type_key = next((k for k in element.keys() if k not in ['objectId', 'size', 'transform', 'elementProperties']), None)
+
+        if element_type_key == 'table':
             extract_table_data_for_debug(element, dest_slide_id, table_format)
             row_headers, col_headers = _get_table_headers(element, table_format)
             data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+
             for r_idx in range(data_start_row, element['table']['rows']):
                 for c_idx in range(1, element['table']['columns']):
-                    cell = element['table']['tableRows'][r_idx]['tableCells'][c_idx]
-                    line = get_text_content_from_element(cell).strip()
-                    if line:
-                        match = VALUE_PATTERN.search(line)
-                        if match:
-                            metadata.append({
-                                'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
-                                'object_id': element_id, 'label': row_headers[r_idx - data_start_row],
-                                'keyword': col_headers[c_idx - 1], 'value': match.group(0).strip(), 'confidence': 1.0
-                            })
+                    try:
+                        line = get_text_content_from_element(element['table']['tableRows'][r_idx]['tableCells'][c_idx]).strip()
+                        if line:
+                            value_match = VALUE_PATTERN.search(line)
+                            if value_match:
+                                metadata.append({
+                                    'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
+                                    'object_id': element_id, 'label': row_headers[r_idx - data_start_row], 'keyword': col_headers[c_idx - 1],
+                                    'value': value_match.group(0).strip(), 'confidence': 1.0
+                                })
+                    except Exception as e:
+                        logging.error(f"TABLE_ERROR: Failed to process cell R:{r_idx}, C:{c_idx}. Error: {e}")
             continue
 
         full_text = get_text_content_from_element(element)
-        if not full_text: continue
+        if not full_text.strip(): continue
 
-        for line in full_text.split('\n'):
-            if not line.strip(): continue
-            for keyword, alias in FIN_KEYWORDS.items():
-                confidence = fuzz.partial_ratio(keyword.lower(), line.lower()) / 100.0
-                if confidence >= KEYWORD_CONFIDENCE_THRESHOLD:
-                    match = VALUE_PATTERN.search(line)
-                    if match:
-                        metadata.append({
-                            'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
-                            'object_id': element_id, 'label': 'No Label Found', 'keyword': keyword,
-                            'value': match.group(0).strip(), 'confidence': round(confidence, 4)
-                        })
-                        break
+        logging.debug(f"KEYWORD_ANALYSIS: Slide ID: {dest_slide_id}. Element {element_id}. Text: '{full_text.strip()[:50]}...'")
+
+        for line_idx, line in enumerate(full_text.split('\n')):
+            if line.strip():
+                for keyword, alias in FIN_KEYWORDS.items():
+                    confidence = fuzz.partial_ratio(keyword.lower(), line.lower()) / 100.0
+                    logging.debug(f"   MATCH_ATTEMPT: Slide ID: {dest_slide_id}. Line {line_idx+1}: '{line.strip()[:30]}...' -> Term '{keyword}' Score: {confidence:.4f}")
+
+                    if confidence >= KEYWORD_CONFIDENCE_THRESHOLD:
+                        value_match = VALUE_PATTERN.search(line)
+                        if value_match:
+                            value = value_match.group(0).strip()
+                            logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{keyword}' Value='{value}' Confidence={round(confidence, 4)}")
+                            metadata.append({
+                                'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
+                                'object_id': element_id, 'label': "No Label Found", 'keyword': keyword, 'value': value,
+                                'confidence': round(confidence, 4)
+                            })
+                            break
     return metadata
 
 # --- Main Execution ---
