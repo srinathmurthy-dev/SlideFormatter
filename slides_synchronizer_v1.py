@@ -278,16 +278,15 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         thumbnail_url = response.get('contentUrl')
         logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
 
-        # The thumbnail URL is a pre-signed URL and should be fetched directly without extra headers.
-        response = requests.get(thumbnail_url)
+        # Use authenticated credentials to perform an HTTP GET request
+        response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
 
         if response.status_code == 200:
             image_bytes = response.content
-            logging.debug(f"OCR_STEP: Successfully downloaded image bytes from pre-signed URL.")
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
         else:
-            # If the request fails, log the status and the response content for debugging.
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}.")
-            logging.error(f"OCR_ERROR_CONTENT: {response.text}")
+            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
+            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
             return extracted_text # Return empty text if download fails
 
         # 2. Upload to GCS
@@ -302,37 +301,9 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         request = documentai.ProcessRequest(name=processor_name, raw_document=image)
         response = docai_client.process_document(request=request)
 
-        if response.document:
+        if response.document.text:
+            extracted_text = response.document.text.strip()
             logging.info("OCR_SUCCESS: Document AI processed successfully.")
-
-            # Helper function to extract text from a specific layout segment
-            def get_text_from_segment(segment, full_text):
-                if not segment: return ""
-                return full_text[segment.start_index:segment.end_index].strip()
-
-            full_text_content = response.document.text
-            reconstructed_content = []
-
-            for page in response.document.pages:
-                # Process tables first
-                for table in page.tables:
-                    table_text = ""
-                    # Reconstruct header
-                    for header_row in table.header_rows:
-                        row_cells = [get_text_from_segment(cell.layout.text_anchor, full_text_content) for cell in header_row.cells]
-                        table_text += "\t".join(row_cells) + "\n"
-                    # Reconstruct body
-                    for body_row in table.body_rows:
-                        row_cells = [get_text_from_segment(cell.layout.text_anchor, full_text_content) for cell in body_row.cells]
-                        table_text += "\t".join(row_cells) + "\n"
-                    reconstructed_content.append(table_text)
-
-                # You can add similar logic here for page.paragraphs, page.form_fields etc. if needed
-                # For now, we will just add the raw text of the page if no tables are found
-                if not page.tables:
-                    reconstructed_content.append(get_text_from_segment(page.layout.text_anchor, full_text_content))
-
-            extracted_text = "\n\n".join(reconstructed_content).strip()
 
     except HttpError as e:
         logging.error(f"OCR_ERROR: Slides/Drive API error during image processing: {e}")
@@ -361,73 +332,22 @@ def convert_emu_to_pt(magnitude, original_unit):
     return magnitude, original_unit
 # ------------------------------
 
-# --- HELPER: GENERATE GRANULAR TEXT/PARAGRAPH STYLE REQUESTS ---
-def generate_style_update_requests(object_id, master_element, cell_location=None):
-    """Generates detailed requests to update text and paragraph styling."""
-    requests = []
-
-    # Determine the correct text object from the master element
-    text_obj = None
-    if 'text' in master_element:
-        text_obj = master_element['text']
-    elif 'shape' in master_element and 'text' in master_element['shape']:
-        text_obj = master_element['shape']['text']
-    elif 'table' in master_element and cell_location:
-         # For tables, we need to locate the specific cell's text property
-        cell = master_element['table']['tableRows'][cell_location['rowIndex']]['tableCells'][cell_location['columnIndex']]
-        if 'text' in cell:
-            text_obj = cell['text']
-
-    if not text_obj or 'textElements' not in text_obj:
-        return []
-
-    # Process each text element to generate style update requests
-    for element in text_obj['textElements']:
-        start_index = element.get('startIndex', 0)
-        end_index = element.get('endIndex', 1)
-
-        # 1. Update Text Style (font, color, bold, etc.)
-        if 'textRun' in element and 'style' in element['textRun']:
-            style = scrub_read_only_fields(element['textRun']['style'])
-            if style:
-                requests.append({
-                    'updateTextStyle': {
-                        'objectId': object_id,
-                        'cellLocation': cell_location,
-                        'style': style,
-                        'textRange': {'type': 'FIXED_RANGE', 'startIndex': start_index, 'endIndex': end_index},
-                        'fields': '*' # Use a wildcard field mask for simplicity to update all fields in the style
-                    }
-                })
-
-        # 2. Update Paragraph Style (alignment, spacing, etc.)
-        if 'paragraphMarker' in element and 'style' in element['paragraphMarker']:
-            style = scrub_read_only_fields(element['paragraphMarker']['style'])
-            if style:
-                requests.append({
-                    'updateParagraphStyle': {
-                        'objectId': object_id,
-                        'cellLocation': cell_location,
-                        'style': style,
-                        'textRange': {'type': 'FIXED_RANGE', 'startIndex': start_index, 'endIndex': end_index},
-                        'fields': '*' # Use a wildcard field mask for simplicity
-                    }
-                })
-
-    return requests
+# --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
+def generate_text_style_requests(object_id, text_elements, cell_location=None):
+    return []
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
 def scrub_read_only_fields(properties):
     """Recursively removes known read-only fields from a dictionary."""
 
-    # More targeted list of fields that are truly read-only or managed by the API.
-    # This allows styling and transform properties to be preserved.
+    # Aggressive list of fields that cause 'Invalid field mask' errors
     READ_ONLY_FIELDS = [
-        'parentObjectId', 'propertyState', 'resolvedSize', 'resolvedTransform',
-        'isPlaceholder', 'placeholderId', 'kind', 'source', 'parentTextRange',
-        'content', # This is part of the textRun, but content is handled by insertText
-        'text' # The 'text' object itself is complex; content is handled separately.
+        'placeholder', 'placeholderId', 'parentObjectId', 'propertyState',
+        'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
+        'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span',
+        'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
+        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
     ]
 
     if isinstance(properties, dict):
@@ -666,61 +586,44 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
 
         if matching_dest_id:
-            # --- ACTION: UPDATE EXISTING OBJECT ---
+            # --- ACTION: UPDATE EXISTING OBJECT (Skipped in this baseline) ---
             target_id = matching_dest_id
-            logging.debug(f"ACTION: UPDATE existing object {target_id} of type {element_type}.")
-
-            # 1. Update Shape/Image/Table properties
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-                requests.append({'updateShapeProperties': {'objectId': target_id, 'shapeProperties': props, 'fields': '*'}})
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                props = scrub_read_only_fields(master_element['image']['imageProperties'])
-                requests.append({'updateImageProperties': {'objectId': target_id, 'imageProperties': props, 'fields': '*'}})
-
-            # 2. Update Text Content and Style
-            if element_type in ('shape', 'table'):
-                # First, clear existing text to avoid style conflicts
-                requests.append({'deleteText': {'objectId': target_id, 'textRange': {'type': 'ALL'}}})
-
-                # Insert the new text content from the master
-                full_text = get_text_content_from_element(master_element)
-                if full_text:
-                    requests.append({'insertText': {'objectId': target_id, 'text': full_text}})
-
-                # Apply detailed text and paragraph styling
-                requests.extend(generate_style_update_requests(target_id, master_element))
+            logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
 
             GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
 
         else:
-            # --- ACTION: ADD NEW OBJECT ---
+            # --- ACTION: ADD NEW OBJECT (Creation Logic) ---
             new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            create_request_body = {}
-            if element_type == 'shape':
-                create_request_body = {'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}}
-                if 'shapeProperties' in master_element['shape']:
-                    create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image':
-                create_request_body = {'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}}
-                if 'imageProperties' in master_element['image']:
-                    create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table':
-                create_request_body = {'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}}
-                if 'tableProperties' in master_element['table']:
-                     create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
+            # Creation Request Body
+            create_request_body = {
+                'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
+            } if element_type == 'shape' else {
+                'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}
+            } if element_type == 'image' else {
+                'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
+            }
 
-            if create_request_body:
-                requests.append(create_request_body)
+            # Apply styling properties as SIBLINGS (Standard REST structure)
+            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+            elif element_type == 'image' and 'imageProperties' in master_element['image']:
+                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
+            elif element_type == 'table' and 'tableProperties' in master_element['table']:
+                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
 
-            # Apply text content and styling for new objects
-            if element_type in ('shape', 'table'):
-                full_text = get_text_content_from_element(master_element)
-                if full_text:
-                    requests.append({'insertText': {'objectId': new_element_id, 'text': full_text}})
-                requests.extend(generate_style_update_requests(new_element_id, master_element))
+            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
+            requests.append(create_request_body)
+
+            # Apply basic text content (without styling update requests)
+            if element_type == 'shape' or element_type == 'table':
+                target_id = new_element_id
+                if 'text' in master_element:
+                    full_text = get_text_content_from_element(master_element)
+                    if full_text.strip():
+                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
 
