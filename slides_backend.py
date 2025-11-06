@@ -241,6 +241,11 @@ def get_text_content_from_element(element):
     if not text_obj: return ""
     return "".join(te.get('textRun', {}).get('content', '') or '\n' for te in text_obj.get('textElements', [])).strip()
 
+def _create_field_mask(props):
+    """Creates a field mask from the top-level keys of a properties dictionary."""
+    if not isinstance(props, dict): return ""
+    return ",".join(props.keys())
+
 def generate_style_update_requests(object_id, master_element):
     requests = []
     text_obj = master_element.get('text') or master_element.get('shape', {}).get('text')
@@ -248,9 +253,15 @@ def generate_style_update_requests(object_id, master_element):
     for te in text_obj.get('textElements', []):
         text_range = {'type': 'FIXED_RANGE', 'startIndex': te.get('startIndex', 0), 'endIndex': te.get('endIndex', 1)}
         if 'textRun' in te and 'style' in te['textRun']:
-            requests.append({'updateTextStyle': {'objectId': object_id, 'style': scrub_read_only_fields(te['textRun']['style']), 'textRange': text_range, 'fields': '*'}})
+            style = scrub_read_only_fields(te['textRun']['style'])
+            field_mask = _create_field_mask(style)
+            if field_mask:
+                requests.append({'updateTextStyle': {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}})
         if 'paragraphMarker' in te and 'style' in te['paragraphMarker']:
-            requests.append({'updateParagraphStyle': {'objectId': object_id, 'style': scrub_read_only_fields(te['paragraphMarker']['style']), 'textRange': text_range, 'fields': '*'}})
+            style = scrub_read_only_fields(te['paragraphMarker']['style'])
+            field_mask = _create_field_mask(style)
+            if field_mask:
+                requests.append({'updateParagraphStyle': {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}})
     return requests
 
 # --- Main Sync Logic ---
@@ -272,10 +283,16 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
         matching_id = find_master_match(me, dest_elements)
         if matching_id: # Update
-            if element_type == 'shape':
-                requests.append({'updateShapeProperties': {'objectId': matching_id, 'shapeProperties': scrub_read_only_fields(me['shape']['shapeProperties']), 'fields': '*'}})
-            elif element_type == 'image':
-                requests.append({'updateImageProperties': {'objectId': matching_id, 'imageProperties': scrub_read_only_fields(me['image']['imageProperties']), 'fields': '*'}})
+            if element_type == 'shape' and 'shapeProperties' in me['shape']:
+                props = scrub_read_only_fields(me['shape']['shapeProperties'])
+                field_mask = _create_field_mask(props)
+                if field_mask:
+                    requests.append({'updateShapeProperties': {'objectId': matching_id, 'shapeProperties': props, 'fields': field_mask}})
+            elif element_type == 'image' and 'imageProperties' in me['image']:
+                props = scrub_read_only_fields(me['image']['imageProperties'])
+                field_mask = _create_field_mask(props)
+                if field_mask:
+                    requests.append({'updateImageProperties': {'objectId': matching_id, 'imageProperties': props, 'fields': field_mask}})
 
             if element_type in ('shape', 'table'):
                 requests.append({'deleteText': {'objectId': matching_id, 'textRange': {'type': 'ALL'}}})
@@ -286,15 +303,21 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             new_id = uuid.uuid4().hex
             props = {'pageObjectId': dest_slide_id, 'size': me.get('size'), 'transform': me.get('transform')}
 
-            create_req = {}
             if element_type == 'shape':
-                create_req = {'createShape': {'objectId': new_id, 'shapeType': me['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': props}}
-                if 'shapeProperties' in me['shape']: create_req['createShape']['shapeProperties'] = scrub_read_only_fields(me['shape']['shapeProperties'])
+                requests.append({'createShape': {'objectId': new_id, 'shapeType': me['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': props}})
+                if 'shapeProperties' in me['shape']:
+                    shape_props = scrub_read_only_fields(me['shape']['shapeProperties'])
+                    field_mask = _create_field_mask(shape_props)
+                    if field_mask:
+                        requests.append({'updateShapeProperties': {'objectId': new_id, 'shapeProperties': shape_props, 'fields': field_mask}})
             elif element_type == 'image':
-                create_req = {'createImage': {'url': me['image']['contentUrl'], 'elementProperties': props}}
-                if 'imageProperties' in me['image']: create_req['createImage']['imageProperties'] = scrub_read_only_fields(me['image']['imageProperties'])
+                requests.append({'createImage': {'url': me['image']['contentUrl'], 'elementProperties': props}})
+                if 'imageProperties' in me['image']:
+                    image_props = scrub_read_only_fields(me['image']['imageProperties'])
+                    field_mask = _create_field_mask(image_props)
+                    if field_mask:
+                        requests.append({'updateImageProperties': {'objectId': new_id, 'imageProperties': image_props, 'fields': field_mask}})
 
-            if create_req: requests.append(create_req)
             if element_type in ('shape', 'table'):
                 full_text = get_text_content_from_element(me)
                 if full_text: requests.append({'insertText': {'objectId': new_id, 'text': full_text}})
@@ -303,10 +326,83 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
     return requests
 
 # --- Keyword Validation Logic ---
+def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Headers"):
+    table_prop = table_element['table']
+    rows, cols = table_prop['rows'], table_prop['columns']
+    table_rows = table_prop['tableRows']
+    row_headers, col_headers = [], []
+
+    if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
+        if rows >= 2:
+            row_0_cells = table_rows[0]['tableCells']
+            row_1_cells = table_rows[1]['tableCells']
+            for c_idx in range(1, cols):
+                h1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
+                h2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
+                col_headers.append(f"{h1} - {h2}" if h1 and h2 else h1 or h2 or f"[Empty Col {c_idx}]")
+        for r_idx in range(2, rows):
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row {r_idx}]")
+    else: # Format 1
+        if rows > 0:
+            for c_idx in range(1, cols):
+                col_headers.append(get_text_content_from_element(table_rows[0]['tableCells'][c_idx]).strip() or f"[Empty Col {c_idx}]")
+        for r_idx in range(1, rows):
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row {r_idx}]")
+    return row_headers, col_headers
+
+def extract_table_data_for_debug(table_element, dest_slide_id, table_format):
+    row_headers, col_headers = _get_table_headers(table_element, table_format)
+    data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+    for r_idx in range(data_start_row, table_element['table']['rows']):
+        for c_idx in range(1, table_element['table']['columns']):
+            cell = table_element['table']['tableRows'][r_idx]['tableCells'][c_idx]
+            value = get_text_content_from_element(cell).strip()
+            if value:
+                row_label = row_headers[r_idx - data_start_row]
+                col_keyword = col_headers[c_idx - 1]
+                logging.info(f"TABLE_INTERSECTION: Slide {dest_slide_id}. Label='{row_label}' / Keyword='{col_keyword}' / Value='{value}'")
+
 def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format):
-    # This function is complex and contains the validation logic.
-    # It would be migrated here. For brevity in this example, it's represented by this comment.
-    return []
+    metadata = []
+    VALUE_PATTERN = re.compile(r'(\([\+\-]?[\d\.,]+%\)|[\+\-]?\$?[\d\.,]+[KMT]?\s?[\(]*[\+\-]?[\d\.,]+%\)*|[\+\-]?\$?[\d\.,]+[KMT]?|\([\+\-]?[\d\.,]+%\))', re.IGNORECASE)
+
+    for element in page_elements:
+        element_id = element.get('objectId', 'unknown')
+        if 'table' in element:
+            extract_table_data_for_debug(element, dest_slide_id, table_format)
+            row_headers, col_headers = _get_table_headers(element, table_format)
+            data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+            for r_idx in range(data_start_row, element['table']['rows']):
+                for c_idx in range(1, element['table']['columns']):
+                    cell = element['table']['tableRows'][r_idx]['tableCells'][c_idx]
+                    line = get_text_content_from_element(cell).strip()
+                    if line:
+                        match = VALUE_PATTERN.search(line)
+                        if match:
+                            metadata.append({
+                                'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
+                                'object_id': element_id, 'label': row_headers[r_idx - data_start_row],
+                                'keyword': col_headers[c_idx - 1], 'value': match.group(0).strip(), 'confidence': 1.0
+                            })
+            continue
+
+        full_text = get_text_content_from_element(element)
+        if not full_text: continue
+
+        for line in full_text.split('\n'):
+            if not line.strip(): continue
+            for keyword, alias in FIN_KEYWORDS.items():
+                confidence = fuzz.partial_ratio(keyword.lower(), line.lower()) / 100.0
+                if confidence >= KEYWORD_CONFIDENCE_THRESHOLD:
+                    match = VALUE_PATTERN.search(line)
+                    if match:
+                        metadata.append({
+                            'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id,
+                            'object_id': element_id, 'label': 'No Label Found', 'keyword': keyword,
+                            'value': match.group(0).strip(), 'confidence': round(confidence, 4)
+                        })
+                        break
+    return metadata
 
 # --- Main Execution ---
 def run_back_end(master_url, dest_url, table_format, status_output):
