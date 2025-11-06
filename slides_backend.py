@@ -247,31 +247,34 @@ def _create_field_mask(props):
     return ",".join(props.keys())
 
 def generate_style_update_requests(object_id, master_element, cell_location=None):
+    """
+    Applies the dominant style from a master element to the entire text range of a destination element.
+    """
     requests = []
-    # When processing a table cell, the cell itself is passed as the `master_element`.
     text_obj = master_element.get('text') or master_element.get('shape', {}).get('text')
     if not text_obj: return []
 
-    for te in text_obj.get('textElements', []):
-        text_range = {'type': 'FIXED_RANGE', 'startIndex': te.get('startIndex', 0), 'endIndex': te.get('endIndex', 1)}
+    # Define a single text range that covers all content
+    full_range = {'type': 'ALL'}
 
-        # Text Style (font, color, etc.)
-        if 'textRun' in te and 'style' in te['textRun']:
-            style = scrub_read_only_fields(te['textRun']['style'])
-            field_mask = _create_field_mask(style)
-            if field_mask:
-                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
-                if cell_location: req_body['cellLocation'] = cell_location
-                requests.append({'updateTextStyle': req_body})
+    # Find the first dominant text style and apply it to the whole range
+    first_text_run_style = next((te.get('textRun', {}).get('style') for te in text_obj.get('textElements', []) if te.get('textRun')), None)
+    if first_text_run_style:
+        style = scrub_read_only_fields(first_text_run_style)
+        if (mask := _create_field_mask(style)):
+            req_body = {'objectId': object_id, 'style': style, 'textRange': full_range, 'fields': mask}
+            if cell_location: req_body['cellLocation'] = cell_location
+            requests.append({'updateTextStyle': req_body})
 
-        # Paragraph Style (alignment, etc.)
-        if 'paragraphMarker' in te and 'style' in te['paragraphMarker']:
-            style = scrub_read_only_fields(te['paragraphMarker']['style'])
-            field_mask = _create_field_mask(style)
-            if field_mask:
-                req_body = {'objectId': object_id, 'style': style, 'textRange': text_range, 'fields': field_mask}
-                if cell_location: req_body['cellLocation'] = cell_location
-                requests.append({'updateParagraphStyle': req_body})
+    # Find the first dominant paragraph style and apply it to the whole range
+    first_paragraph_style = next((te.get('paragraphMarker', {}).get('style') for te in text_obj.get('textElements', []) if te.get('paragraphMarker')), None)
+    if first_paragraph_style:
+        style = scrub_read_only_fields(first_paragraph_style)
+        if (mask := _create_field_mask(style)):
+            req_body = {'objectId': object_id, 'style': style, 'textRange': full_range, 'fields': mask}
+            if cell_location: req_body['cellLocation'] = cell_location
+            requests.append({'updateParagraphStyle': req_body})
+
     return requests
 
 # --- Main Sync Logic ---
@@ -297,9 +300,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 if 'shapeProperties' in me['shape']:
                     props = scrub_read_only_fields(me['shape']['shapeProperties'])
                     if (mask := _create_field_mask(props)): requests.append({'updateShapeProperties': {'objectId': matching_id, 'shapeProperties': props, 'fields': mask}})
-                # Replicate shape text
-                requests.append({'deleteText': {'objectId': matching_id, 'textRange': {'type': 'ALL'}}})
-                if (text := get_text_content_from_element(me)): requests.append({'insertText': {'objectId': matching_id, 'text': text}})
+                # Text content is preserved. Only update styling.
                 requests.extend(generate_style_update_requests(matching_id, me))
 
             elif element_type == 'image':
@@ -320,8 +321,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 if 'shapeProperties' in me['shape']:
                     shape_props = scrub_read_only_fields(me['shape']['shapeProperties'])
                     if (mask := _create_field_mask(shape_props)): requests.append({'updateShapeProperties': {'objectId': new_id, 'shapeProperties': shape_props, 'fields': mask}})
-                # Replicate shape text
-                if (text := get_text_content_from_element(me)): requests.append({'insertText': {'objectId': new_id, 'text': text}})
+                # New shapes are templates, do not add text. Only apply styling.
                 requests.extend(generate_style_update_requests(new_id, me))
 
             elif element_type == 'image':
@@ -480,27 +480,7 @@ def _replicate_table_content_requests(table_id, master_table_element):
         for c_idx, cell in enumerate(row.get('tableCells', [])):
             cell_loc = {'rowIndex': r_idx, 'columnIndex': c_idx}
 
-            # 1. Clear existing content from the cell
-            requests.append({
-                'deleteText': {
-                    'objectId': table_id,
-                    'cellLocation': cell_loc,
-                    'textRange': {'type': 'ALL'}
-                }
-            })
-
-            # 2. Insert new text content into the cell
-            full_text = get_text_content_from_element(cell)
-            if full_text:
-                requests.append({
-                    'insertText': {
-                        'objectId': table_id,
-                        'cellLocation': cell_loc,
-                        'text': full_text
-                    }
-                })
-
-            # 3. Apply detailed styling to the text within the cell
+            # Text content is preserved. Only apply styling.
             # We pass the cell itself as the 'master_element' because it contains the 'text' object.
             requests.extend(generate_style_update_requests(table_id, cell, cell_location=cell_loc))
 
