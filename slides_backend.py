@@ -139,5 +139,118 @@ def get_service():
 
 # --- Main Execution Function (FULL DEFINITION IN BLOCK 2) ---
 def run_back_end(master_url, dest_id_or_url, table_format, status_output):
-    # This is the full, original run_back_end function.
-    pass
+
+    LOG_FILE_PLACEHOLDER = f"{LOG_FILENAME}"
+
+    try: # --- Global Crash Protection Start ---
+
+        logging.info("--- STARTING Run Cycle ---")
+        GLOBAL_METADATA['Table_Data'] = []; GLOBAL_METADATA['Keyword_Values'] = []
+        total_inconsistencies = 0
+
+        # 1. AUTHENTICATION & SETUP
+        slides_service, drive_service, docai_client, storage_client = get_service()
+        if not slides_service or not drive_service or not docai_client or not storage_client:
+            with status_output: print("❌ Error: Authentication or Service setup failed. Check log file.")
+            return LOG_FILE_PLACEHOLDER, -1
+
+        master_id = extract_id_from_url(master_url); destination_files = find_destination_files(drive_service, dest_id_or_url)
+
+        if not destination_files:
+            logging.error("No valid destination Slides files found.");
+            with status_output: print("❌ Error: No valid destination Slides files/folders found.")
+            return LOG_FILE_PLACEHOLDER, -1
+
+        master_slides_map, master_pres = get_slide_page_elements(slides_service, master_id); master_slide_list = master_pres.get('slides', [])
+
+        if not master_slide_list:
+            logging.error("Master presentation is empty.");
+            with status_output: print("❌ Error: Master presentation is empty.")
+            return LOG_FILE_PLACEHOLDER, -1
+
+        logging.info(f"Processing started for {len(destination_files)} destination presentation(s).")
+
+        # 2. MAIN PROCESSING LOOP
+        for dest_file in destination_files:
+            dest_id = dest_file['id']; dest_name = dest_file['name']
+            with status_output: print(f"\nProcessing: **{dest_name}** ({dest_id})")
+            logging.info(f"--- Starting File Processing: {dest_name} ---")
+
+            dest_slides_map, dest_pres = get_slide_page_elements(slides_service, dest_id)
+
+            # Match slides by index (assuming same order is the sync requirement)
+            for i, master_slide in enumerate(master_slide_list):
+
+                try: # --- DEFENSIVE SLIDE ITERATION TRY/EXCEPT ---
+                    logging.info(f"Starting Slide {i+1}/{len(master_slide_list)} sync.")
+
+                    # Skip if master slide index exceeds destination slide count
+                    if i >= len(dest_pres.get('slides', [])): continue
+
+                    master_slide_id = master_slide['objectId']; dest_slide = dest_pres['slides'][i]; dest_slide_id = dest_slide['objectId']
+
+                    # Run Copy/Delete sync logic
+                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client)
+
+                    # Run validation logic on existing content in destination
+                    dest_slide_elements = dest_slide.get('pageElements', [])
+
+                    # Call validation using the table_format argument
+                    keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
+                    GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
+
+                    if copy_requests:
+                        logging.debug(f"Executing BatchUpdate with {len(copy_requests)} requests.")
+                        try:
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': copy_requests}).execute()
+                            logging.info(f"Applied {len(copy_requests)} batch updates to slide {i+1} successfully.")
+                        except HttpError as e:
+                            logging.error(f"BatchUpdate failed on {dest_name}, slide {i+1}: {e}"); total_inconsistencies += 1
+
+                except Exception as e:
+                    logging.error(f"CRITICAL PARSING ERROR in Slide {i+1} of {dest_name}. Traceback: {e}"); total_inconsistencies += 1
+                    continue
+
+            logging.info(f"--- Finished File Processing: {dest_name} ---")
+
+        # 3. FINAL CONSISTENCY CHECK & CONFIDENCE REPORTING
+        logging.info("Starting final consistency and confidence report.")
+        keyword_groups = {};
+
+        # LOGGING: Report number of items collected
+        logging.debug(f"CONSISTENCY: Analyzing {len(GLOBAL_METADATA['Keyword_Values'])} keyword instances.")
+
+        # Group entries by unique (label, keyword) pair
+        for entry in GLOBAL_METADATA['Keyword_Values']:
+            key = (entry['label'], entry['keyword'])
+            # Safely append the entry to the list corresponding to the key
+            keyword_groups.setdefault(key, []).append(entry)
+
+        # Iterate over grouped results for reporting
+        for key, entries in keyword_groups.items():
+
+            # Collect unique values found for this keyword group
+            unique_values = set([e['value'] for e in entries])
+
+            # LOGGING: Report grouping and unique values
+            logging.debug(f"CONSISTENCY_GROUP: Label='{key[0]}', Keyword='{key[1]}'. Unique Values Found: {list(unique_values)}")
+
+            # Check for value inconsistency (if multiple distinct values exist)
+            if len(unique_values) != 1:
+                total_inconsistencies += 1; logging.error(f"[RED FONT] INCONSISTENT VALUE across slides for Label='{key[0]}', Keyword='{key[1]}'. Found: {list(unique_values)}")
+
+            # Check for low confidence (regardless of value consistency)
+            for entry in entries:
+                if entry['confidence'] < KEYWORD_CONFIDENCE_THRESHOLD:
+                    total_inconsistencies += 1
+                    logging.error(f"[RED FONT] LOW CONFIDENCE ({entry['confidence']:.4f}): Keyword '{entry['keyword']}' below threshold {KEYWORD_CONFIDENCE_THRESHOLD}. Slide: {entry['dest_id']}")
+
+        logging.info("--- Run Cycle Complete ---")
+
+        # 4. FINAL RETURN
+        return LOG_FILE_PLACEHOLDER, -1 if total_inconsistencies > 0 else 0
+
+    except Exception as e:
+        logging.error(f"FATAL PYTHON CRASH: The run_back_end function terminated unexpectedly.")
+        logging.error(f"Error Details: {type(e).__name__} - {e}")
+        return LOG_FILE_PLACEHOLDER, -1
