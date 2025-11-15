@@ -98,8 +98,9 @@ def display_ui():
         status_output
     ], layout=Layout(width='800px', border='1px solid lightgray', padding='10px'))
 
-    display(ui)
+    return ui
 
-# To run the UI, you would now have a cell in your notebook that just contains:
+# To run the UI, you would now have a cell in your notebook that contains:
 # from slides_ui import display_ui
-# display_ui()
+# my_ui = display_ui()
+# my_ui
