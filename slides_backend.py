@@ -248,7 +248,7 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, presentation_id, page_id):
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
@@ -258,20 +258,19 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         # CRITICAL DEBUGGING PRINTS
         logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
         logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
-        
+
         # 1. Download image data using the reliable Slides API thumbnail method
         image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
-        
+        logging.debug(f"OCR_STEP: Requesting slide thumbnail for page ID: {page_id} in Presentation ID: {presentation_id}")
+
         # Get the credentials for authenticated request
         creds = slides_service._http.credentials
-        
-        # Request the thumbnail URL for the specific image element within the presentation
+
+        # Request the thumbnail URL for the page containing the element.
+        # NOTE: This captures the whole slide. Element-specific thumbnails are not supported.
         response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id, 
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id, 
+            presentationId=presentation_id,
+            pageObjectId=page_id,
             thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
         ).execute()
 
@@ -368,6 +367,12 @@ def scrub_read_only_fields(properties):
         return [scrub_read_only_fields(item) for item in properties]
     else:
         return properties
+
+def _create_field_mask(properties):
+    """Creates a Slides API field mask from a dictionary of properties."""
+    # The mask should only include the top-level keys from the properties dictionary.
+    # The Slides API uses camelCase for its field names.
+    return ",".join(properties.keys())
 # -------------------------------------------------------------------------
 
 # --- HELPER: Extracts text content from any element (Shape, Table Cell) ---
@@ -571,7 +576,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         if element_type == 'image':
             logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
             # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
+            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, master_pres_id, master_slide_id)
             
             if extracted_text:
                 logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
@@ -593,37 +598,56 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
 
         else:
-            # --- ACTION: ADD NEW OBJECT (Creation Logic) ---
+            # --- ACTION: ADD NEW OBJECT (Two-Step Create/Update Process) ---
             new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            # Creation Request Body
-            create_request_body = {
-                'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
-            } if element_type == 'shape' else {
-                'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}
-            } if element_type == 'image' else {
-                'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
-            }
+            # --- STEP 1: CREATE the object with basic properties ---
+            create_request = None
+            if element_type == 'shape':
+                create_request = {'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}}
+            elif element_type == 'image':
+                create_request = {'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}}
+            elif element_type == 'table':
+                 create_request = {'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}}
             
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
+            if create_request:
+                requests.append(create_request)
+                logging.debug(f"RAW REQUEST (Create): {json.dumps(create_request, indent=2)}")
 
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
-            requests.append(create_request_body)
-            
+            # --- STEP 2: UPDATE the object with styling properties and a field mask ---
+            update_request = None
+            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+                props = master_element['shape']['shapeProperties']
+                update_request = {
+                    'updateShapeProperties': {
+                        'objectId': new_element_id,
+                        'shapeProperties': props,
+                        'fields': _create_field_mask(props)
+                    }
+                }
+            elif element_type == 'image' and 'imageProperties' in master_element['image']:
+                props = master_element['image']['imageProperties']
+                update_request = {
+                    'updateImageProperties': {
+                        'objectId': new_element_id,
+                        'imageProperties': props,
+                        'fields': _create_field_mask(props)
+                    }
+                }
+            # Note: Table properties are generally less complex and often set at creation.
+            # This logic can be expanded if specific table property updates are needed.
+
+            if update_request:
+                requests.append(update_request)
+                logging.debug(f"RAW REQUEST (Update Style): {json.dumps(update_request, indent=2)}")
+
             # Apply basic text content (without styling update requests)
             if element_type == 'shape' or element_type == 'table':
                 target_id = new_element_id
-                if 'text' in master_element:
-                    full_text = get_text_content_from_element(master_element)
-                    if full_text.strip(): 
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+                full_text = get_text_content_from_element(master_element)
+                if full_text.strip():
+                    requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
             
