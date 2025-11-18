@@ -248,7 +248,7 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, presentation_id, page_id):
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
@@ -258,21 +258,21 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         # CRITICAL DEBUGGING PRINTS
         logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
         logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
-        
+
         # 1. Download image data using the reliable Slides API thumbnail method
         image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
-        
+        logging.debug(f"OCR_STEP: Requesting slide thumbnail for page ID: {page_id} in Presentation ID: {presentation_id}")
+
         # Get the credentials for authenticated request
         creds = slides_service._http.credentials
-        
-        # Request the thumbnail URL for the specific image element within the presentation
+
+        # Request the thumbnail URL for the page containing the element.
+        # NOTE: This captures the whole slide. Element-specific thumbnails are not supported.
         response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id, 
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id, 
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
+            presentationId=presentation_id,
+            pageObjectId=page_id,
+            thumbnailProperties_thumbnailSize='LARGE',
+            thumbnailProperties_mimeType='PNG'
         ).execute()
 
         thumbnail_url = response.get('contentUrl')
@@ -337,37 +337,29 @@ def generate_text_style_requests(object_id, text_elements, cell_location=None):
     return []
 # --------------------------------------------------------
 
-# --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
-def scrub_read_only_fields(properties):
-    """Recursively removes known read-only fields from a dictionary."""
-    
-    # Aggressive list of fields that cause 'Invalid field mask' errors
-    READ_ONLY_FIELDS = [
-        'placeholder', 'placeholderId', 'parentObjectId', 'propertyState', 
-        'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
-        'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span', 
-        'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
-        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
-    ]
-    
-    if isinstance(properties, dict):
-        new_properties = {}
-        for key, value in properties.items():
-            # Convert key to snake_case for comparison (to catch both)
-            snake_key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+def _create_recursive_field_mask(properties, parent_key=''):
+    """
+    Recursively traverses a dictionary to create a dot-notated field mask,
+    filtering out read-only fields along the way.
+    """
+    mask_paths = []
+    # Per the API docs, these top-level fields are read-only and must be excluded.
+    READ_ONLY_FIELDS = ['placeholder', 'propertyState']
+
+    for key, value in properties.items():
+        # Skip read-only fields at the top level of the properties object.
+        if parent_key == '' and key in READ_ONLY_FIELDS:
+            continue
+
+        current_key = f"{parent_key}.{key}" if parent_key else key
+
+        if isinstance(value, dict):
+            mask_paths.extend(_create_recursive_field_mask(value, parent_key=current_key))
+        else:
+            # We only add the path if it's a leaf node.
+            mask_paths.append(current_key)
             
-            if snake_key not in READ_ONLY_FIELDS and key not in READ_ONLY_FIELDS:
-                if isinstance(value, (dict, list)):
-                    new_properties[key] = scrub_read_only_fields(value)
-                else:
-                    new_properties[key] = value
-            else:
-                logging.debug(f"SCRUB: Removing read-only field: {key}")
-        return new_properties
-    elif isinstance(properties, list):
-        return [scrub_read_only_fields(item) for item in properties]
-    else:
-        return properties
+    return mask_paths
 # -------------------------------------------------------------------------
 
 # --- HELPER: Extracts text content from any element (Shape, Table Cell) ---
@@ -514,118 +506,90 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         if not find_master_match(dest_element, master_elements):
             requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
 
-    # PHASE 2 & 3: ADD NEW OR UPDATE EXISTING OBJECTS
-    logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
+    # PHASE 2: CREATE MISSING OBJECTS
+    logging.debug(f"Phase 2: Checking {len(master_elements)} master elements for creation.")
     for master_element in master_elements:
-        
-        # --- CORRECTLY DETERMINE element_type ---
-        element_id = master_element['objectId']
-        TYPE_KEYS = ('objectId', 'size', 'transform') # Keys to ignore when finding the type
-        
-        element_type = None
-        for key in master_element.keys():
-            if key not in TYPE_KEYS:
-                element_type = key # e.g., 'shape', 'image', 'table'
-                break
-                
-        if not element_type:
-            logging.warning(f"UNHANDLED: Could not determine type for object ID {element_id}. Skipping.")
-            continue
-        # ---------------------------------------------
+        if not find_master_match(master_element, dest_elements):
+            new_element_id = master_element['objectId'] # Use master ID for predictability
 
-        # Existence Check - See if the master element already exists in the destination
-        matching_dest_id = find_master_match(master_element, dest_elements) # Define variable
-        
-        # --- DIMENSIONAL CONVERSION AND UNIT ENFORCEMENT ---
-        # *** INITIALIZE element_properties BEFORE USE ***
-        element_properties = {'pageObjectId': dest_slide_id} 
-        
-        master_size = copy.deepcopy(master_element.get('size', {}))
-        if master_size:
-            if master_size.get('width'):
-                mag, unit = convert_emu_to_pt(master_size['width'].get('magnitude', 0), master_size['width'].get('unit', 'EMU'))
-                master_size['width']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['width']['unit'] = 'PT' 
-            if master_size.get('height'):
-                mag, unit = convert_emu_to_pt(master_size['height'].get('magnitude', 0), master_size['height'].get('unit', 'EMU'))
-                master_size['height']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['height']['unit'] = 'PT' 
+            # --- Correctly determine element_type ---
+            TYPE_KEYS = ('objectId', 'size', 'transform')
+            element_type = next((key for key in master_element if key not in TYPE_KEYS), None)
 
-        master_transform = copy.deepcopy(master_element.get('transform', {}))
-        if master_transform:
-            if 'translateX' in master_transform:
-                master_transform['translateX'], _ = convert_emu_to_pt(master_transform['translateX'], 'EMU')
-                master_transform['translateX'] = round(master_transform['translateX'], 3)
-            if 'translateY' in master_transform:
-                master_transform['translateY'], _ = convert_emu_to_pt(master_transform['translateY'], 'EMU')
-                master_transform['translateY'] = round(master_transform['translateY'], 3)
-            master_transform['unit'] = 'PT' 
-        
-        if master_size and (master_size.get('width') or master_size.get('height')): element_properties['size'] = master_size
-        if master_transform and ('translateX' in master_transform or 'translateY' in master_transform or 'unit' in master_transform): element_properties['transform'] = master_transform
+            if not element_type:
+                logging.warning(f"UNHANDLED: Could not determine type for object ID {new_element_id}. Skipping.")
+                continue
 
-        
-        # --------------------------------------------------------------------------------
-        # FIX: OCR CALL INTEGRATION (Guaranteed execution path for images)
-        # --------------------------------------------------------------------------------
-        if element_type == 'image':
-            logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
-            
-            if extracted_text:
-                logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
-                
-                # Append the extracted text as a shape/text-element structure for validation processing
-                # We use the current hardcoded format string for this standalone validation call
-                keyword_metadata = process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, [{'text': {'textElements': [{'textRun': {'content': extracted_text}}]}}], "Format 1: Row 0/Col 0 Headers")
-                GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
-            else:
-                logging.warning("OCR_RESULT: Image processing returned no readable text.")
-        # --------------------------------------------------------------------------------
-
-
-        if matching_dest_id:
-            # --- ACTION: UPDATE EXISTING OBJECT (Skipped in this baseline) ---
-            target_id = matching_dest_id
-            logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
-            
-            GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
-
-        else:
-            # --- ACTION: ADD NEW OBJECT (Creation Logic) ---
-            new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            # Creation Request Body
-            create_request_body = {
-                'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
-            } if element_type == 'shape' else {
-                'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}
-            } if element_type == 'image' else {
-                'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
-            }
-            
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
+            # --- Dimensional Conversion and Unit Enforcement ---
+            element_properties = {'pageObjectId': dest_slide_id}
+            master_size = copy.deepcopy(master_element.get('size', {}))
+            if master_size:
+                # ... (conversion logic remains the same)
+                if master_size.get('width'):
+                    mag, unit = convert_emu_to_pt(master_size['width'].get('magnitude', 0), master_size['width'].get('unit', 'EMU'))
+                    master_size['width']['magnitude'], master_size['width']['unit'] = round(mag, 3), 'PT'
+                if master_size.get('height'):
+                    mag, unit = convert_emu_to_pt(master_size['height'].get('magnitude', 0), master_size['height'].get('unit', 'EMU'))
+                    master_size['height']['magnitude'], master_size['height']['unit'] = round(mag, 3), 'PT'
+                element_properties['size'] = master_size
 
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
-            requests.append(create_request_body)
-            
-            # Apply basic text content (without styling update requests)
-            if element_type == 'shape' or element_type == 'table':
-                target_id = new_element_id
-                if 'text' in master_element:
-                    full_text = get_text_content_from_element(master_element)
-                    if full_text.strip(): 
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+            master_transform = copy.deepcopy(master_element.get('transform', {}))
+            if master_transform:
+                # ... (conversion logic remains the same)
+                if 'translateX' in master_transform: master_transform['translateX'], _ = convert_emu_to_pt(master_transform['translateX'], 'EMU')
+                if 'translateY' in master_transform: master_transform['translateY'], _ = convert_emu_to_pt(master_transform['translateY'], 'EMU')
+                master_transform['unit'] = 'PT'
+                element_properties['transform'] = master_transform
 
-            GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
+            create_request = None
+            if element_type == 'shape':
+                create_request = {'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX')}}
+            elif element_type == 'image':
+                create_request = {'createImage': {'url': master_element['image']['contentUrl']}}
+            elif element_type == 'table':
+                create_request = {'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns']}}
+
+            if create_request:
+                requests.append(create_request)
+
+    # PHASE 3: APPLY FORMATTING AND CONTENT TO ALL OBJECTS
+    logging.debug(f"Phase 3: Checking {len(master_elements)} master elements for formatting.")
+    for master_element in master_elements:
+        element_id = master_element['objectId']
+        TYPE_KEYS = ('objectId', 'size', 'transform')
+        element_type = next((key for key in master_element if key not in TYPE_KEYS), None)
+
+        # --- OCR Processing (now in the formatting phase) ---
+        if element_type == 'image':
+            # ... (OCR logic remains the same)
+            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, master_pres_id, master_slide_id)
+            if extracted_text:
+                keyword_metadata = process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, [{'text': {'textElements': [{'textRun': {'content': extracted_text}}]}}], "Format 1: Row 0/Col 0 Headers")
+                GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
+
+        # --- Apply Styling/Formatting (TEMPORARILY DISABLED FOR DEBUGGING) ---
+        # The block below is commented out to create a stable baseline.
+        # We will add properties back one by one to find the source of the error.
+        update_request = None
+        # if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+        #     props = master_element['shape']['shapeProperties']
+        #     update_request = {'updateShapeProperties': {'objectId': element_id, 'shapeProperties': props, 'fields': ",".join(_create_recursive_field_mask(props))}}
+        # elif element_type == 'image' and 'imageProperties' in master_element['image']:
+        #     props = master_element['image']['imageProperties']
+        #     update_request = {'updateImageProperties': {'objectId': element_id, 'imageProperties': props, 'fields': ",".join(_create_recursive_field_mask(props))}}
+
+        if update_request:
+            requests.append(update_request)
+
+        # --- Apply Text Content ---
+        if element_type == 'shape' or element_type == 'table':
+            full_text = get_text_content_from_element(master_element)
+            if full_text.strip():
+                # Delete existing text before inserting new text
+                requests.append({'deleteText': {'objectId': element_id, 'textRange': {'type': 'ALL'}}})
+                requests.append({'insertText': {'objectId': element_id, 'text': full_text.strip()}})
             
     logging.info(f"Finished synchronization. Generated {len(requests)} batch requests.")
     return requests
