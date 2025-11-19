@@ -611,11 +611,15 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             if element_type == 'table':
                 formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element))
             elif element_type == 'shape':
-                full_text = get_text_content_from_element(master_element)
-                # Only process text operations if the master element has actual text content.
-                if full_text.strip():
-                    # ADDRESS REVIEW: If the text ends with a newline, the API does not count it for indexing,
-                    # so we must remove it before insertion to prevent an 'end index out of bounds' error.
+                # A shape is considered to have text if it has a textRun with content.
+                # An element with only a paragraphMarker is effectively empty for API text operations.
+                has_actual_text = any(
+                    'textRun' in te and te.get('textRun', {}).get('content', '').strip()
+                    for te in text_elements
+                )
+
+                if has_actual_text:
+                    full_text = get_text_content_from_element(master_element)
                     if full_text.endswith('\n'):
                         full_text = full_text[:-1]
 
@@ -644,23 +648,27 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
         for c_idx in range(cols):
             try:
                 cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]
-                cell_content = get_text_content_from_element(cell)
                 
-                # Only perform text operations if the master cell has actual, visible content.
-                if cell_content.strip():
+                text_elements = cell.get('text', {}).get('textElements', [])
+                has_actual_text = any(
+                    'textRun' in te and te.get('textRun', {}).get('content', '').strip()
+                    for te in text_elements
+                )
+
+                if has_actual_text:
+                    cell_content = get_text_content_from_element(cell)
                     cell_location = {'rowIndex': r_idx, 'columnIndex': c_idx}
 
                     requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
 
-                    # Handle potential trailing newline issue, similar to shapes.
                     if cell_content.endswith('\n'):
                         cell_content = cell_content[:-1]
 
                     if cell_content:
                         requests.append({'insertText': {'objectId': table_id, 'cellLocation': cell_location, 'text': cell_content}})
                     
-                    if cell.get('text', {}).get('textElements'):
-                        requests.extend(generate_text_style_requests(table_id, cell['text']['textElements'], cell_location))
+                    if text_elements:
+                        requests.extend(generate_text_style_requests(table_id, text_elements, cell_location))
 
             except Exception as e:
                 logging.warning(f"Error parsing table cell {r_idx},{c_idx} for text/style replication: {e}")
