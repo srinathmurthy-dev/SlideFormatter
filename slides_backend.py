@@ -375,7 +375,7 @@ def generate_text_style_requests(object_id, text_elements, cell_location=None):
                 request_body = {
                     'objectId': object_id,
                     'style': styles_to_apply,
-                    'textRange': {'startIndex': start_index, 'endIndex': end_index},
+                    'textRange': {'type': 'FIXED_RANGE', 'startIndex': start_index, 'endIndex': end_index},
                     'fields': ",".join(styles_to_apply.keys())
                 }
 
