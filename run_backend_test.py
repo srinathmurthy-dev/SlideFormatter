@@ -23,7 +23,7 @@ def main():
     # Corrected URLs to test diffing functionality
     master_url = 'https://docs.google.com/presentation/d/1z-0M3lxGkD2J591FXWDO-3rYNfckHIY9xs1-tw6G-mA'
     destination_url = 'https://docs.google.com/presentation/d/1CLNSV1AQELkm3fiTBB5bTGGYrZNpPWnuhBWccLbJ9r4'
-    table_format = 'Format 1: Row 0/Col 0 Headers'
+    table_format = "Format 2: Dual Header (Rows 0 & 1 Combined)"
 
     # Create an instance of our dummy UI output widget
     dummy_output = DummyStatusOutput()

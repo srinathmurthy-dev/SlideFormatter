@@ -261,7 +261,7 @@ def _get_text_from_docai_layout(layout, full_text):
 
 def _convert_docai_table_to_slides_format(docai_table, full_text):
     """Converts a Document AI table object into a dictionary that mimics the Google Slides API table structure."""
-    all_rows = docai_table.header_rows + docai_table.body_rows
+    all_rows = list(docai_table.header_rows) + list(docai_table.body_rows)
     if not all_rows: return None
 
     num_rows, num_cols = len(all_rows), max((len(row.cells) for row in all_rows), default=0)
