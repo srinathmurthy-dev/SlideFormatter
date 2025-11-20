@@ -553,6 +553,16 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
     except HttpError as e:
         logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return [], [], {}
 
+    # Helper to determine if an element (shape) has actual text content.
+    def _element_has_text(element):
+        element_type_key = next((k for k in element if k not in ['objectId', 'size', 'transform', 'elementProperties']), None)
+        if not element_type_key: return False
+        text_elements = element.get(element_type_key, {}).get('text', {}).get('textElements', [])
+        return any('textRun' in te and te.get('textRun', {}).get('content', '').strip() for te in text_elements)
+
+    # Build a set of destination object IDs that already contain text to be deleted.
+    dest_elements_with_text = {el['objectId'] for el in dest_elements if _element_has_text(el)}
+
     master_elements = master_slide_json.get('pageElements', [])
 
     # Phase 1A: DELETE objects from destination that are not in the master.
@@ -576,7 +586,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 if 'width' in size: size['width']['magnitude'], size['width']['unit'] = round(convert_emu_to_pt(size['width'].get('magnitude', 0), size['width'].get('unit', 'EMU'))[0], 3), 'PT'
                 if 'height' in size: size['height']['magnitude'], size['height']['unit'] = round(convert_emu_to_pt(size['height'].get('magnitude', 0), size['height'].get('unit', 'EMU'))[0], 3), 'PT'
                 element_properties['size'] = size
-            
+
             if transform := copy.deepcopy(master_element.get('transform')):
                 if 'translateX' in transform: transform['translateX'], _ = convert_emu_to_pt(transform['translateX'], 'EMU')
                 if 'translateY' in transform: transform['translateY'], _ = convert_emu_to_pt(transform['translateY'], 'EMU')
@@ -609,7 +619,10 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         if master_element.get(element_type, {}).get('text'):
             text_elements = master_element[element_type]['text']['textElements']
             if element_type == 'table':
-                formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element))
+                dest_table_element = None
+                if (dest_id := existing_id_map.get(master_id)):
+                    dest_table_element = next((el for el in dest_elements if el['objectId'] == dest_id), None)
+                formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element, dest_table_element))
             elif element_type == 'shape':
                 # A shape is considered to have text if it has a textRun with content.
                 # An element with only a paragraphMarker is effectively empty for API text operations.
@@ -619,11 +632,15 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 )
 
                 if has_actual_text:
+                    # Only delete text from the destination if it's a pre-existing object that contains text.
+                    dest_match_id = existing_id_map.get(master_id)
+                    if dest_match_id and dest_match_id in dest_elements_with_text:
+                        formatting_requests.append({'deleteText': {'objectId': master_id, 'textRange': {'type': 'ALL'}}})
+
                     full_text = get_text_content_from_element(master_element)
                     if full_text.endswith('\n'):
                         full_text = full_text[:-1]
 
-                    formatting_requests.append({'deleteText': {'objectId': master_id, 'textRange': {'type': 'ALL'}}})
                     if full_text:
                         formatting_requests.append({'insertText': {'objectId': master_id, 'text': full_text}})
                     formatting_requests.extend(generate_text_style_requests(master_id, text_elements))
@@ -633,7 +650,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
 # --- Helper Functions for Text/Table Processing ---
 
-def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element):
+def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element, dest_table_element=None):
     """
     Generates API requests to replicate the text content and styling for each
     cell in a master table.
@@ -642,33 +659,38 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
     table_prop = table_element['table']
     rows, cols = table_prop['rows'], table_prop['columns']
 
+    def _cell_has_text(cell):
+        text_elements = cell.get('text', {}).get('textElements', [])
+        return any('textRun' in te and te.get('textRun', {}).get('content', '').strip() for te in text_elements)
+
     logging.debug(f"Processing Table {table_id} text content and styling.")
     
     for r_idx in range(rows):
         for c_idx in range(cols):
             try:
-                cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]
+                master_cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]
                 
-                text_elements = cell.get('text', {}).get('textElements', [])
-                has_actual_text = any(
-                    'textRun' in te and te.get('textRun', {}).get('content', '').strip()
-                    for te in text_elements
-                )
-
-                if has_actual_text:
-                    cell_content = get_text_content_from_element(cell)
+                if _cell_has_text(master_cell):
                     cell_location = {'rowIndex': r_idx, 'columnIndex': c_idx}
 
-                    requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
+                    # Check if the corresponding destination cell has text that needs to be cleared.
+                    if dest_table_element:
+                         try:
+                             dest_cell = dest_table_element['table']['tableRows'][r_idx]['tableCells'][c_idx]
+                             if _cell_has_text(dest_cell):
+                                 requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
+                         except (KeyError, IndexError):
+                             pass # Destination table is smaller or cell doesn't exist; no need to delete.
 
+                    cell_content = get_text_content_from_element(master_cell)
                     if cell_content.endswith('\n'):
                         cell_content = cell_content[:-1]
 
                     if cell_content:
                         requests.append({'insertText': {'objectId': table_id, 'cellLocation': cell_location, 'text': cell_content}})
                     
-                    if text_elements:
-                        requests.extend(generate_text_style_requests(table_id, text_elements, cell_location))
+                    if master_cell.get('text', {}).get('textElements'):
+                        requests.extend(generate_text_style_requests(table_id, master_cell['text']['textElements'], cell_location))
 
             except Exception as e:
                 logging.warning(f"Error parsing table cell {r_idx},{c_idx} for text/style replication: {e}")
