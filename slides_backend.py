@@ -260,29 +260,30 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, presentation_id, page_id):
+    """Processes an image, detects tables, and returns a list of fake 'page element' objects for validation."""
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
     blob = None
+    ocr_elements = [] # Return list of elements
 
     try:
         # CRITICAL DEBUGGING PRINTS
         logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
         logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
 
         # 1. Download image data using the reliable Slides API thumbnail method
         image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
+        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {presentation_id} Page: {page_id}")
 
         # Get the credentials for authenticated request
         creds = slides_service._http.credentials
 
         # Request the thumbnail URL for the specific image element within the presentation
         response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id,
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
+            presentationId=presentation_id,
+            pageObjectId=page_id,
             elementId=image_obj_id,
             thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
         ).execute()
@@ -313,9 +314,24 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         request = documentai.ProcessRequest(name=processor_name, raw_document=image)
         response = docai_client.process_document(request=request)
         
-        if response.document.text:
-            extracted_text = response.document.text.strip()
-            logging.info("OCR_SUCCESS: Document AI processed successfully.")
+        # Convert Document AI Table to pseudo-slides elements
+        has_tables = False
+        if response.document.pages:
+            for page in response.document.pages:
+                if page.tables:
+                    has_tables = True
+                    logging.info(f"OCR_TABLE_DETECT: Found {len(page.tables)} table(s) in image.")
+                    for table in page.tables:
+                        fake_table = _convert_docai_table_to_slides_format(table, response.document.text)
+                        if fake_table:
+                            ocr_elements.append(fake_table)
+
+        if not has_tables and response.document.text:
+            logging.info("OCR_TABLE_DETECT: No tables found, processing as plain text.")
+            ocr_elements.append({
+                'objectId': f"ocr_text_{uuid.uuid4().hex[:8]}",
+                'text': {'textElements': [{'textRun': {'content': response.document.text.strip()}}]}
+            })
             
     except HttpError as e:
         logging.error(f"OCR_ERROR: Slides/Drive API error during image processing: {e}")
@@ -330,7 +346,7 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         except Exception as e:
             logging.warning(f"OCR_WARNING: Failed to delete GCS object: {e}")
             
-    return extracted_text
+    return ocr_elements
 
 # --- UNIT CONVERSION HELPER ---
 EMU_PER_PT = 12700

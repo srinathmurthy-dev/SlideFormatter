@@ -1,0 +1,9 @@
+2025-11-21 23:48:20,691 - INFO - Logging configured. Console output enabled. File: slides_validator_debug_3849f011.log
+2025-11-21 23:48:20,692 - INFO - --- STARTING Run Cycle ---
+2025-11-21 23:48:20,692 - INFO - --- STARTING API CLIENT INITIALIZATION ---
+2025-11-21 23:48:20,692 - DEBUG - Starting User OAuth service initialization.
+2025-11-21 23:48:20,692 - DEBUG - Manual user authentication required.
+2025-11-21 23:48:20,692 - ERROR - 'credentials.json' not found. Cannot authenticate.
+2025-11-21 23:48:20,692 - DEBUG - Starting Document AI client initialization (using ADC).
+2025-11-21 23:48:23,821 - ERROR - Document AI Client setup failed via ADC. Ensure Vision/DocAI API is enabled and your user has IAM roles. Error: Your default credentials were not found. To set up Application Default Credentials, see https://cloud.google.com/docs/authentication/external/set-up-adc for more information.
+2025-11-21 23:48:23,821 - ERROR - Failed to initialize one or more required API clients.
