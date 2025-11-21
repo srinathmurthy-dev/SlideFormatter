@@ -332,9 +332,138 @@ def convert_emu_to_pt(magnitude, original_unit):
     return magnitude, original_unit
 # ------------------------------
 
+# --- NEW HELPER: RECURSIVE FIELD MASK GENERATION ---
+def _create_recursive_field_mask(properties, parent_field=""):
+    """
+    Recursively builds a list of dot-notated field paths for the Google Slides API.
+    Excludes specific read-only or problematic fields.
+    """
+    masks = []
+    # Fields to strictly exclude from update masks (read-only or immutable)
+    EXCLUDED_FIELDS = {
+        'type', 'contentUrl', 'placeholder', 'renderScale', 'alignment',
+        'propertyState', 'placeholderId', 'parentObjectId'
+    }
+
+    for key, value in properties.items():
+        if key in EXCLUDED_FIELDS:
+            continue
+
+        current_field = f"{parent_field}.{key}" if parent_field else key
+
+        if isinstance(value, dict):
+            # Recurse into nested dictionary
+            nested_masks = _create_recursive_field_mask(value, current_field)
+            if nested_masks:
+                masks.extend(nested_masks)
+            else:
+                # If dict is empty (or became empty due to exclusion), ignore it.
+                pass
+        else:
+             # It's a leaf value, add the path
+            masks.append(current_field)
+
+    return masks
+
+def generate_shape_update_requests(object_id, master_shape_prop_container):
+    """Generates updateShapeProperties requests using a precise field mask."""
+    requests = []
+
+    if 'shapeProperties' not in master_shape_prop_container:
+        return []
+
+    properties = master_shape_prop_container['shapeProperties']
+
+    # Filter/Scrub first to get clean data structure
+    clean_properties = scrub_read_only_fields(properties)
+
+    # Generate the field mask string (comma-separated)
+    mask_list = _create_recursive_field_mask(clean_properties, "shapeProperties")
+
+    if mask_list:
+        field_mask = ",".join(mask_list)
+        requests.append({
+            'updateShapeProperties': {
+                'objectId': object_id,
+                'shapeProperties': clean_properties,
+                'fields': field_mask
+            }
+        })
+
+    return requests
+
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
-def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    return []
+def generate_text_style_requests(object_id, text_obj, cell_location=None):
+    """Generates detailed text formatting requests (TextStyle and ParagraphStyle)."""
+    requests = []
+    if not text_obj or 'textElements' not in text_obj:
+        return []
+
+    current_index = 0
+
+    for element in text_obj['textElements']:
+        start_index = current_index
+
+        if 'textRun' in element:
+            text_run = element['textRun']
+            content = text_run.get('content', '')
+            if not content: continue
+
+            length = len(content)
+            end_index = start_index + length
+
+            if 'style' in text_run:
+                 clean_style = scrub_read_only_fields(text_run['style'])
+                 mask_list = _create_recursive_field_mask(clean_style, "style")
+
+                 if mask_list:
+                     req = {
+                         'updateTextStyle': {
+                             'objectId': object_id,
+                             'textRange': {
+                                 'type': 'FIXED_RANGE',
+                                 'startIndex': start_index,
+                                 'endIndex': end_index
+                             },
+                             'style': clean_style,
+                             'fields': ",".join(mask_list)
+                         }
+                     }
+                     if cell_location:
+                         req['updateTextStyle']['cellLocation'] = cell_location
+                     requests.append(req)
+
+            current_index += length
+
+        elif 'paragraphMarker' in element:
+            p_marker = element['paragraphMarker']
+            length = 1
+            end_index = start_index + length
+
+            if 'style' in p_marker:
+                 clean_p_style = scrub_read_only_fields(p_marker['style'])
+                 mask_list = _create_recursive_field_mask(clean_p_style, "style")
+
+                 if mask_list:
+                     req = {
+                         'updateParagraphStyle': {
+                             'objectId': object_id,
+                             'textRange': {
+                                 'type': 'FIXED_RANGE',
+                                 'startIndex': start_index,
+                                 'endIndex': end_index
+                             },
+                             'style': clean_p_style,
+                             'fields': ",".join(mask_list)
+                         }
+                     }
+                     if cell_location:
+                         req['updateParagraphStyle']['cellLocation'] = cell_location
+                     requests.append(req)
+
+            current_index += length
+
+    return requests
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
@@ -392,9 +521,8 @@ def get_text_content_from_element(element):
             if 'textRun' in text_element:
                 full_text += text_element['textRun'].get('content', '')
             elif 'paragraphMarker' in text_element:
-                # Append newline to simulate structure breaks
-                if full_text and not full_text.endswith('\n'):
-                     full_text += '\n'
+                # Always append newline for paragraph marker to match API index structure
+                full_text += '\n'
                          
     return full_text.strip()
 # -----------------------------------------------------------------------
@@ -586,9 +714,22 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
 
         if matching_dest_id:
-            # --- ACTION: UPDATE EXISTING OBJECT (Skipped in this baseline) ---
+            # --- ACTION: UPDATE EXISTING OBJECT ---
             target_id = matching_dest_id
-            logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
+
+            if element_type == 'shape':
+                 logging.debug(f"ACTION: UPDATE existing object {target_id} of type {element_type}.")
+                 # Generate Shape Update Requests
+                 shape_reqs = generate_shape_update_requests(target_id, master_element['shape'])
+                 requests.extend(shape_reqs)
+
+                 # Update Text Styles for Existing Shape
+                 if 'text' in master_element['shape']:
+                     text_reqs = generate_text_style_requests(target_id, master_element['shape']['text'])
+                     requests.extend(text_reqs)
+
+            else:
+                logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
             
             GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
 
@@ -617,13 +758,33 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
             requests.append(create_request_body)
             
-            # Apply basic text content (without styling update requests)
-            if element_type == 'shape' or element_type == 'table':
+            # Apply text content AND styling
+            if element_type == 'shape':
                 target_id = new_element_id
-                if 'text' in master_element:
-                    full_text = get_text_content_from_element(master_element)
-                    if full_text.strip(): 
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+                # Check master_element['shape']['text'] or use get_text_content_from_element
+                full_text = get_text_content_from_element(master_element)
+                # Use rstrip('\n') to preserve leading whitespace but avoid double trailing newline
+                text_to_insert = full_text.rstrip('\n')
+                if text_to_insert:
+                    requests.append({'insertText': {'objectId': target_id, 'text': text_to_insert}})
+                    if 'text' in master_element['shape']:
+                         requests.extend(generate_text_style_requests(target_id, master_element['shape']['text']))
+
+            elif element_type == 'table':
+                target_id = new_element_id
+                table_prop = master_element['table']
+                for r_idx in range(table_prop['rows']):
+                     for c_idx in range(table_prop['columns']):
+                         # Safety check for cell existence
+                         if r_idx < len(table_prop['tableRows']) and c_idx < len(table_prop['tableRows'][r_idx]['tableCells']):
+                             cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]
+                             text_to_insert = get_text_content_from_element(cell).rstrip('\n')
+                             if text_to_insert:
+                                 cell_loc = {'rowIndex': r_idx, 'columnIndex': c_idx}
+                                 requests.append({'insertText': {'objectId': target_id, 'cellLocation': cell_loc, 'text': text_to_insert}})
+
+                                 if 'text' in cell:
+                                      requests.extend(generate_text_style_requests(target_id, cell['text'], cell_loc))
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
             
