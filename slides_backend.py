@@ -218,30 +218,26 @@ def find_master_match(element1, element2_list):
     
     # Helper: Extracts and normalizes size/position metrics to Points (PT)
     def get_element_metrics(element):
+        # 1. Get width and height from the 'size' key (uses 'magnitude' as the value in PT)
         size = element.get('size', {})
-        width_val = size.get('width', {}).get('magnitude', 0)
-        width_unit = size.get('width', {}).get('unit', 'EMU')
-        height_val = size.get('height', {}).get('magnitude', 0)
-        height_unit = size.get('height', {}).get('unit', 'EMU')
+        width = size.get('width', {}).get('magnitude', 0)
+        height = size.get('height', {}).get('magnitude', 0)
         
+        # 2. Get X and Y position (translation) from the 'transform' key
         transform = element.get('transform', {})
-        x_pos_val = transform.get('translateX', 0)
-        y_pos_val = transform.get('translateY', 0)
-
-        # The API *always* returns transform translations in EMU, so we must convert them.
-        # Size, however, can be in either EMU or PT.
-        width_pt, _ = convert_emu_to_pt(width_val, width_unit)
-        height_pt, _ = convert_emu_to_pt(height_val, height_unit)
-        x_pos_pt, _ = convert_emu_to_pt(x_pos_val, 'EMU')
-        y_pos_pt, _ = convert_emu_to_pt(y_pos_val, 'EMU')
+        x_pos = transform.get('translateX', 0)
+        y_pos = transform.get('translateY', 0)
         
         # Rounding for reliable comparison
-        return (round(width_pt, 2), round(height_pt, 2), round(x_pos_pt, 2), round(y_pos_pt, 2))
+        return (round(width, 3), round(height, 3), round(x_pos, 3), round(y_pos, 3))
     
     w1, h1, x1, y1 = get_element_metrics(element1)
     
     logging.debug(f"MATCH: Comparing Master ({element1.get('objectId')}) DIMS: W={w1}, H={h1}, X={x1}, Y={y1}")
     
+    # Skip matching check for placeholder elements (e.g., slide titles, footers)
+    if w1 == 0 and h1 == 0 and not element1.get('shape'): return True
+
     for element2 in element2_list:
         w2, h2, x2, y2 = get_element_metrics(element2)
         
@@ -254,89 +250,79 @@ def find_master_match(element1, element2_list):
             
     return None
 
-# --- Document AI Processing & Table Conversion ---
+# --- Document AI Processing ---
 
-def _get_text_from_docai_layout(layout, full_text):
-    """Extracts text from the document's full text based on a layout's text anchor."""
-    if layout and layout.text_anchor and layout.text_anchor.text_segments:
-        return "".join([full_text[segment.start_index:segment.end_index] for segment in layout.text_anchor.text_segments])
-    return ""
-
-def _convert_docai_table_to_slides_format(docai_table, full_text):
-    """Converts a Document AI table object into a dictionary that mimics the Google Slides API table structure."""
-    all_rows = list(docai_table.header_rows) + list(docai_table.body_rows)
-    if not all_rows: return None
-
-    num_rows, num_cols = len(all_rows), max((len(row.cells) for row in all_rows), default=0)
-    table_rows_data = []
-
-    for row in all_rows:
-        table_cells = []
-        for cell in row.cells:
-            cell_text = _get_text_from_docai_layout(cell.layout, full_text).strip().replace('\n', ' ')
-            table_cells.append({'text': {'textElements': [{'textRun': {'content': cell_text}}]}})
-        table_rows_data.append({'tableCells': table_cells})
-
-    return {
-        'objectId': f"ocr_table_{uuid.uuid4().hex[:8]}",
-        'table': {'rows': num_rows, 'columns': num_cols, 'tableRows': table_rows_data}
-    }
-
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, presentation_id, page_id):
-    """Processes an image, detects tables, and returns a list of fake 'page element' objects for validation."""
+def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
-    temp_filename, blob, ocr_elements = f"temp_image_{uuid.uuid4().hex[:8]}.png", None, []
+    temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
+    extracted_text = ""
+    blob = None
 
     try:
-        image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting slide thumbnail for page ID: {page_id} in Presentation ID: {presentation_id}")
+        # CRITICAL DEBUGGING PRINTS
+        logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
+        logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
+        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
 
+        # 1. Download image data using the reliable Slides API thumbnail method
+        image_obj_id = image_element['objectId']
+        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
+
+        # Get the credentials for authenticated request
         creds = slides_service._http.credentials
+
+        # Request the thumbnail URL for the specific image element within the presentation
         response = slides_service.presentations().pages().getThumbnail(
-            presentationId=presentation_id, pageObjectId=page_id,
-            thumbnailProperties_thumbnailSize='LARGE', thumbnailProperties_mimeType='PNG'
+            presentationId=dest_pres_id,
+            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
+            elementId=image_obj_id,
+            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
         ).execute()
 
         thumbnail_url = response.get('contentUrl')
+        logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
+
+        # Use authenticated credentials to perform an HTTP GET request
         response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
         
-        if response.status_code != 200:
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}.")
-            return []
+        if response.status_code == 200:
+            image_bytes = response.content
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
+        else:
+            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
+            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
+            return extracted_text # Return empty text if download fails
 
-        image_bytes = response.content
+        # 2. Upload to GCS
         bucket = storage_client.bucket(GCS_BUCKET_NAME); blob = bucket.blob(temp_filename)
         blob.upload_from_string(image_bytes, content_type='image/png')
-        
-        processor_name = docai_client.processor_path(GCP_PROJECT_ID, "us", DOC_AI_PROCESSOR_ID)
-        request = documentai.ProcessRequest(name=processor_name, raw_document=documentai.RawDocument(content=image_bytes, mime_type="image/png"))
-        document = docai_client.process_document(request=request).document
+        logging.info(f"OCR_STEP: Image uploaded to GCS: {GCS_BUCKET_NAME}/{temp_filename}")
 
-        has_tables = False
-        if document.pages:
-            for page in document.pages:
-                if page.tables:
-                    has_tables, _ = True, logging.info(f"OCR_TABLE_DETECT: Found {len(page.tables)} table(s) in image.")
-                    for table in page.tables:
-                        if fake_table := _convert_docai_table_to_slides_format(table, document.text):
-                            ocr_elements.append(fake_table)
+        # 3. Process via Document AI
+        image = documentai.RawDocument(content=image_bytes, mime_type="image/png")
+        processor_name = docai_client.processor_path(GCP_PROJECT_ID, "us", DOC_AI_PROCESSOR_ID)
         
-        if not has_tables and document.text:
-            logging.info("OCR_TABLE_DETECT: No tables found, processing as plain text.")
-            ocr_elements.append({
-                'objectId': f"ocr_text_{uuid.uuid4().hex[:8]}",
-                'text': {'textElements': [{'textRun': {'content': document.text.strip()}}]}
-            })
+        request = documentai.ProcessRequest(name=processor_name, raw_document=image)
+        response = docai_client.process_document(request=request)
+        
+        if response.document.text:
+            extracted_text = response.document.text.strip()
+            logging.info("OCR_SUCCESS: Document AI processed successfully.")
             
-    except HttpError as e: logging.error(f"OCR_ERROR: Slides/Drive API error: {e}")
-    except Exception as e: logging.error(f"OCR_ERROR: Document AI processing failed: {e}")
+    except HttpError as e:
+        logging.error(f"OCR_ERROR: Slides/Drive API error during image processing: {e}")
+    except Exception as e:
+        logging.error(f"OCR_ERROR: Document AI processing failed (Check GCP_PROJECT_ID/Processor_ID/Permissions). Error: {e}")
     finally:
+        # 4. Cleanup GCS - Robust deletion attempt
         try:
             if blob and storage_client.bucket(GCS_BUCKET_NAME).blob(temp_filename).exists():
                 blob.delete()
-        except Exception as e: logging.warning(f"OCR_WARNING: Failed to delete GCS object: {e}")
+                logging.debug("OCR_STEP: Cleaned up GCS object.")
+        except Exception as e:
+            logging.warning(f"OCR_WARNING: Failed to delete GCS object: {e}")
             
-    return ocr_elements
+    return extracted_text
 
 # --- UNIT CONVERSION HELPER ---
 EMU_PER_PT = 12700
@@ -351,10 +337,11 @@ def convert_emu_to_pt(magnitude, original_unit):
 # ------------------------------
 
 # --- HELPER: GENERATE GRANULAR TEXT FORMATTING REQUESTS ---
-def generate_text_formatting_requests(object_id, text_elements, cell_location=None):
+def generate_text_formatting_requests(object_id, text_elements, cell_location=None, allowed_fields=None):
     """
-    Generates a list of UpdateTextStyle and UpdateParagraphStyle requests
-    for a given set of textElements, handling text runs, paragraph styles, and bullets.
+    Generates a list of UpdateTextStyle and UpdateParagraphStyle requests.
+    If allowed_fields is provided (set of strings), only applies those properties.
+    Useful for restricted updates on existing objects.
     """
     requests = []
 
@@ -364,11 +351,13 @@ def generate_text_formatting_requests(object_id, text_elements, cell_location=No
             style = text_element['textRun'].get('style', {})
 
             styles_to_apply = {}
-            if 'foregroundColor' in style: styles_to_apply['foregroundColor'] = style.get('foregroundColor')
-            if 'fontFamily' in style: styles_to_apply['fontFamily'] = style.get('fontFamily')
-            if 'fontSize' in style: styles_to_apply['fontSize'] = style.get('fontSize')
-            if 'bold' in style: styles_to_apply['bold'] = style.get('bold')
-            if 'italic' in style: styles_to_apply['italic'] = style.get('italic')
+            # Map of potential keys to check
+            potential_styles = ['foregroundColor', 'fontFamily', 'fontSize', 'bold', 'italic']
+
+            for key in potential_styles:
+                if key in style:
+                    if allowed_fields is None or key in allowed_fields:
+                        styles_to_apply[key] = style[key]
 
             start_index = text_element.get('startIndex')
             end_index = text_element.get('endIndex')
@@ -398,11 +387,14 @@ def generate_text_formatting_requests(object_id, text_elements, cell_location=No
 
             if 'style' in text_element['paragraphMarker']:
                 paragraph_style = text_element['paragraphMarker'].get('style', {})
-                styles_to_apply = {
-                    k: paragraph_style.get(k) for k in
-                    ['alignment', 'lineSpacing', 'spaceAbove', 'spaceBelow', 'direction']
-                    if k in paragraph_style
-                }
+
+                styles_to_apply = {}
+                potential_p_styles = ['alignment', 'lineSpacing', 'spaceAbove', 'spaceBelow', 'direction']
+
+                for key in potential_p_styles:
+                    if key in paragraph_style:
+                        if allowed_fields is None or key in allowed_fields:
+                            styles_to_apply[key] = paragraph_style[key]
 
                 if styles_to_apply:
                     request_body = {
@@ -412,7 +404,9 @@ def generate_text_formatting_requests(object_id, text_elements, cell_location=No
                     if cell_location: request_body['cellLocation'] = cell_location
                     requests.append({'updateParagraphStyle': request_body})
 
-            if 'bullet' in text_element['paragraphMarker']:
+            # Bullets are only applied if allowed_fields is None (Full Update)
+            # or if explicitly allowed (unlikely for this use case).
+            if 'bullet' in text_element['paragraphMarker'] and allowed_fields is None:
                 request_body = {
                     'objectId': object_id, 'textRange': text_range,
                     'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'
@@ -649,45 +643,58 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 GLOBAL_METADATA['Keyword_Values'].extend(process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, ocr_elements, "Format 1: Row 0/Col 0 Headers"))
 
         if element_type == 'shape' and (props := master_element.get('shape', {}).get('shapeProperties')):
-            styles_to_apply = {k: props[k] for k in ('shapeBackgroundFill', 'outline') if k in props}
+            # Added contentAlignment to the allowed shape properties
+            styles_to_apply = {k: props[k] for k in ('shapeBackgroundFill', 'outline', 'contentAlignment') if k in props}
             if styles_to_apply:
                 formatting_requests.append({'updateShapeProperties': {'objectId': master_id, 'shapeProperties': styles_to_apply, 'fields': ",".join(_create_recursive_field_mask(styles_to_apply))}})
 
         if master_element.get(element_type, {}).get('text'):
             text_elements = master_element[element_type]['text']['textElements']
+            dest_match_id = existing_id_map.get(master_id)
+            is_existing_object = bool(dest_match_id)
+
             if element_type == 'table':
                 dest_table_element = None
-                if (dest_id := existing_id_map.get(master_id)):
-                    dest_table_element = next((el for el in dest_elements if el['objectId'] == dest_id), None)
-                formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element, dest_table_element))
+                if dest_match_id:
+                    dest_table_element = next((el for el in dest_elements if el['objectId'] == dest_match_id), None)
+                formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element, dest_table_element, is_existing_object))
+
             elif element_type == 'shape':
-                # A shape is considered to have text if it has a textRun with content.
-                # An element with only a paragraphMarker is effectively empty for API text operations.
-                has_actual_text = any(
-                    'textRun' in te and te.get('textRun', {}).get('content', '').strip()
-                    for te in text_elements
-                )
+                # Determine fields to update based on whether object is new or existing
+                allowed_text_fields = None
+                if is_existing_object:
+                    # For EXISTING objects: Only Foreground Color and Alignment. NO Text Copy.
+                    allowed_text_fields = {'foregroundColor', 'alignment'}
 
-                if has_actual_text:
-                    # Only delete text from the destination if it's a pre-existing object that contains text.
-                    dest_match_id = existing_id_map.get(master_id)
-                    if dest_match_id and dest_match_id in dest_elements_with_text:
-                        formatting_requests.append({'deleteText': {'objectId': master_id, 'textRange': {'type': 'ALL'}}})
+                # Only Insert/Delete text for NEW objects
+                if not is_existing_object:
+                    has_actual_text = any(
+                        'textRun' in te and te.get('textRun', {}).get('content', '').strip()
+                        for te in text_elements
+                    )
 
-                    full_text = get_text_content_from_element(master_element)
-                    if full_text.endswith('\n'):
-                        full_text = full_text[:-1]
+                    if has_actual_text:
+                        # This path is only for New Objects, so deletion is redundant but harmless (new obj is empty)
+                        # However, we retain logic for robustness if we ever allow mixed updates
+                        if dest_match_id and dest_match_id in dest_elements_with_text:
+                             formatting_requests.append({'deleteText': {'objectId': master_id, 'textRange': {'type': 'ALL'}}})
 
-                    if full_text:
-                        formatting_requests.append({'insertText': {'objectId': master_id, 'text': full_text}})
-                    formatting_requests.extend(generate_text_formatting_requests(master_id, text_elements))
+                        full_text = get_text_content_from_element(master_element)
+                        if full_text.endswith('\n'):
+                            full_text = full_text[:-1]
+
+                        if full_text:
+                            formatting_requests.append({'insertText': {'objectId': master_id, 'text': full_text}})
+
+                # Apply formatting (Full for New, Partial for Existing)
+                formatting_requests.extend(generate_text_formatting_requests(master_id, text_elements, allowed_fields=allowed_text_fields))
 
     logging.info(f"Finished sync analysis. Generated {len(structural_requests)} structural, {len(formatting_requests)} formatting requests.")
     return structural_requests, formatting_requests, existing_id_map
 
 # --- Helper Functions for Text/Table Processing ---
 
-def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element, dest_table_element=None):
+def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element, dest_table_element=None, is_existing_object=False):
     """
     Generates API requests to replicate the text content and styling for each
     cell in a master table.
@@ -702,6 +709,10 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
 
     logging.debug(f"Processing Table {table_id} text content and styling.")
     
+    allowed_text_fields = None
+    if is_existing_object:
+        allowed_text_fields = {'foregroundColor', 'alignment'}
+
     for r_idx in range(rows):
         for c_idx in range(cols):
             try:
@@ -710,24 +721,27 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
                 if _cell_has_text(master_cell):
                     cell_location = {'rowIndex': r_idx, 'columnIndex': c_idx}
                     
-                    # Check if the corresponding destination cell has text that needs to be cleared.
-                    if dest_table_element:
-                         try:
-                             dest_cell = dest_table_element['table']['tableRows'][r_idx]['tableCells'][c_idx]
-                             if _cell_has_text(dest_cell):
-                                 requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
-                         except (KeyError, IndexError):
-                             pass # Destination table is smaller or cell doesn't exist; no need to delete.
-                    
-                    cell_content = get_text_content_from_element(master_cell)
-                    if cell_content.endswith('\n'):
-                        cell_content = cell_content[:-1]
+                    # Only perform Text Copy operations if it is a NEW object
+                    if not is_existing_object:
+                        # Check if the corresponding destination cell has text that needs to be cleared.
+                        if dest_table_element:
+                             try:
+                                 dest_cell = dest_table_element['table']['tableRows'][r_idx]['tableCells'][c_idx]
+                                 if _cell_has_text(dest_cell):
+                                     requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
+                             except (KeyError, IndexError):
+                                 pass # Destination table is smaller or cell doesn't exist; no need to delete.
 
-                    if cell_content:
-                        requests.append({'insertText': {'objectId': table_id, 'cellLocation': cell_location, 'text': cell_content}})
+                        cell_content = get_text_content_from_element(master_cell)
+                        if cell_content.endswith('\n'):
+                            cell_content = cell_content[:-1]
 
+                        if cell_content:
+                            requests.append({'insertText': {'objectId': table_id, 'cellLocation': cell_location, 'text': cell_content}})
+
+                    # Apply Formatting (Full or Partial)
                     if master_cell.get('text', {}).get('textElements'):
-                        requests.extend(generate_text_formatting_requests(table_id, master_cell['text']['textElements'], cell_location))
+                        requests.extend(generate_text_formatting_requests(table_id, master_cell['text']['textElements'], cell_location, allowed_fields=allowed_text_fields))
 
             except Exception as e:
                 logging.warning(f"Error parsing table cell {r_idx},{c_idx} for text/style replication: {e}")
