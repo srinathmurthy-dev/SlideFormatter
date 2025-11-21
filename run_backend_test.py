@@ -1,48 +1,55 @@
 import sys
-import os
 from slides_backend import run_back_end
 
-# Mock class to simulate the ipywidgets Output widget behavior
+# A dummy class to simulate the ipywidgets.Output context manager
+# This allows the backend function to run without a real UI.
 class DummyStatusOutput:
+    """A mock ipywidgets.Output object that does nothing."""
     def __enter__(self):
-        # In a real ipywidgets.Output, this captures stdout.
-        # Here we just let stdout go to the console.
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
+        # This is called when entering the 'with' block.
         pass
 
-    def clear_output(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # This is called when exiting the 'with' block.
         pass
+
+def main():
+    """
+    Runs the backend synchronization process with predefined URLs.
+    This script is a command-line alternative to the Jupyter UI.
+    """
+    print("--- Starting Backend Test Script ---")
+
+    # Corrected URLs to test diffing functionality
+    master_url = 'https://docs.google.com/presentation/d/1z-0M3lxGkD2J591FXWDO-3rYNfckHIY9xs1-tw6G-mA'
+    destination_url = 'https://docs.google.com/presentation/d/1CLNSV1AQELkm3fiTBB5bTGGYrZNpPWnuhBWccLbJ9r4'
+    table_format = "Format 2: Dual Header (Rows 0 & 1 Combined)"
+
+    # Create an instance of our dummy UI output widget
+    dummy_output = DummyStatusOutput()
+
+    print(f"Master URL: {master_url}")
+    print(f"Destination URL: {destination_url}")
+    print(f"Table Format: {table_format}\n")
+
+    # Call the main backend function
+    # The print statements from the backend will go to the console.
+    log_file, status_code = run_back_end(
+        master_url,
+        destination_url,
+        table_format,
+        dummy_output
+    )
+
+    print("\n--- Backend Process Complete ---")
+    print(f"Status Code: {status_code}")
+    print(f"Log File: {log_file}")
+
+    if status_code == 0:
+        print("\nResult: Completed with no inconsistencies.")
+    else:
+        print("\nResult: **Inconsistencies found. Please check the log file for details.**")
+        sys.exit(1) # Exit with an error code to indicate failure
 
 if __name__ == "__main__":
-    # Configuration
-    MASTER_URL = 'https://docs.google.com/presentation/d/1z-0M3lxGkD2J591FXWDO-3rYNfckHIY9xs1-tw6G-mA'
-    DEST_URL = 'https://docs.google.com/presentation/d/1CLNSV1AQELkm3fiTBB5bTGGYrZNpPWnuhBWccLbJ9r4'
-    TABLE_FORMAT = 'Format 2: Dual Header (Rows 0 & 1 Combined)'
-
-    print("--- STARTING BACKEND TEST ---")
-    print(f"Master: {MASTER_URL}")
-    print(f"Dest: {DEST_URL}")
-    print(f"Format: {TABLE_FORMAT}")
-
-    # Instantiate the dummy widget
-    status_output = DummyStatusOutput()
-
-    # Run the backend
-    try:
-        log_file, status_code = run_back_end(MASTER_URL, DEST_URL, TABLE_FORMAT, status_output)
-
-        print("\n--- TEST COMPLETE ---")
-        print(f"Log File: {log_file}")
-        print(f"Status Code: {status_code}")
-
-        if status_code == 0:
-            print("SUCCESS: No inconsistencies found.")
-            sys.exit(0)
-        else:
-            print("FAILURE: Inconsistencies found or error occurred.")
-            sys.exit(1)
-    except Exception as e:
-        print(f"\nCRITICAL FAILURE: {e}")
-        sys.exit(1)
+    main()
