@@ -62,12 +62,16 @@ FIN_KEYWORDS = {
     'Gross Margin %': 'GM %',
     'Gross Profit %': 'GP %',
     'Net Revenue %': 'Net Rev %',
-    'MoM $': 'M/M $',
-    'MoQ': 'Q/Q',
-    'YoY': 'Y/Y',
+    'M/M $': 'M/M $',
+    'M/M %': 'M/M %',
+    'Q/Q $': 'Q/Q $',
+    'Q/Q %': 'Q/Q %',
+    'Y/Y $': 'Y/Y $',
+    'Y/Y %': 'Y/Y %',
     'Gross Margin': 'GM',
     'Gross Profit': 'GP',
     'Gross Revenue': 'Gross Rev',
+    'Net Revenue (PROFORMA)': 'Net Rev (PROFORMA)',
     'Net Revenue': 'Net Rev',
 }
 
@@ -212,20 +216,28 @@ def find_master_match(element1, element2_list):
        Returns the matching destination objectId if found, otherwise None.
     """
     
-    # Helper: Extracts size from 'size' and position (translation) from 'transform'
+    # Helper: Extracts and normalizes size/position metrics to Points (PT)
     def get_element_metrics(element):
         # 1. Get width and height from the 'size' key (uses 'magnitude' as the value in PT)
         size = element.get('size', {})
-        width = size.get('width', {}).get('magnitude', 0)
-        height = size.get('height', {}).get('magnitude', 0)
+        width_val = size.get('width', {}).get('magnitude', 0)
+        width_unit = size.get('width', {}).get('unit', 'EMU')
+        height_val = size.get('height', {}).get('magnitude', 0)
+        height_unit = size.get('height', {}).get('unit', 'EMU')
         
-        # 2. Get X and Y position (translation) from the 'transform' key
         transform = element.get('transform', {})
-        x_pos = transform.get('translateX', 0)
-        y_pos = transform.get('translateY', 0)
+        x_pos_val = transform.get('translateX', 0)
+        y_pos_val = transform.get('translateY', 0)
+
+        # The API *always* returns transform translations in EMU, so we must convert them.
+        # Size, however, can be in either EMU or PT.
+        width_pt, _ = convert_emu_to_pt(width_val, width_unit)
+        height_pt, _ = convert_emu_to_pt(height_val, height_unit)
+        x_pos_pt, _ = convert_emu_to_pt(x_pos_val, 'EMU')
+        y_pos_pt, _ = convert_emu_to_pt(y_pos_val, 'EMU')
         
         # Rounding for reliable comparison
-        return (round(width, 3), round(height, 3), round(x_pos, 3), round(y_pos, 3))
+        return (round(width_pt, 2), round(height_pt, 2), round(x_pos_pt, 2), round(y_pos_pt, 2))
     
     w1, h1, x1, y1 = get_element_metrics(element1)
     
@@ -332,42 +344,112 @@ def convert_emu_to_pt(magnitude, original_unit):
     return magnitude, original_unit
 # ------------------------------
 
-# --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
-def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    return []
-# --------------------------------------------------------
+# --- HELPER: GENERATE GRANULAR TEXT FORMATTING REQUESTS ---
+def generate_text_formatting_requests(object_id, text_elements, cell_location=None, allowed_fields=None):
+    """
+    Generates a list of UpdateTextStyle and UpdateParagraphStyle requests.
+    If allowed_fields is provided (set of strings), only applies those properties.
+    Useful for restricted updates on existing objects.
+    """
+    requests = []
 
-# --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
-def scrub_read_only_fields(properties):
-    """Recursively removes known read-only fields from a dictionary."""
+    # --- Text Run Styling ---
+    for text_element in text_elements:
+        if 'textRun' in text_element and 'content' in text_element['textRun']:
+            style = text_element['textRun'].get('style', {})
 
-    # Aggressive list of fields that cause 'Invalid field mask' errors
-    READ_ONLY_FIELDS = [
-        'placeholder', 'placeholderId', 'parentObjectId', 'propertyState',
-        'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
-        'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span',
-        'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
-        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
-    ]
+            styles_to_apply = {}
+            # Map of potential keys to check
+            potential_styles = ['foregroundColor', 'fontFamily', 'fontSize', 'bold', 'italic']
 
-    if isinstance(properties, dict):
-        new_properties = {}
-        for key, value in properties.items():
-            # Convert key to snake_case for comparison (to catch both)
-            snake_key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+            for key in potential_styles:
+                if key in style:
+                    if allowed_fields is None or key in allowed_fields:
+                        styles_to_apply[key] = style[key]
 
-            if snake_key not in READ_ONLY_FIELDS and key not in READ_ONLY_FIELDS:
-                if isinstance(value, (dict, list)):
-                    new_properties[key] = scrub_read_only_fields(value)
-                else:
-                    new_properties[key] = value
-            else:
-                logging.debug(f"SCRUB: Removing read-only field: {key}")
-        return new_properties
-    elif isinstance(properties, list):
-        return [scrub_read_only_fields(item) for item in properties]
-    else:
-        return properties
+            start_index = text_element.get('startIndex')
+            end_index = text_element.get('endIndex')
+
+            if styles_to_apply and start_index is not None and end_index is not None:
+                request_body = {
+                    'objectId': object_id,
+                    'style': styles_to_apply,
+                    'textRange': {'type': 'FIXED_RANGE', 'startIndex': start_index, 'endIndex': end_index},
+                    'fields': ",".join(_create_recursive_field_mask(styles_to_apply))
+                }
+                if cell_location: request_body['cellLocation'] = cell_location
+                requests.append({'updateTextStyle': request_body})
+
+    # --- Paragraph and Bullet Styling ---
+    last_paragraph_end = 0
+    for text_element in text_elements:
+        if 'paragraphMarker' in text_element:
+            paragraph_start_index = last_paragraph_end
+            paragraph_end_index = text_element.get('endIndex')
+
+            if paragraph_start_index is None or paragraph_end_index is None or paragraph_start_index == paragraph_end_index:
+                if paragraph_end_index is not None: last_paragraph_end = paragraph_end_index
+                continue
+
+            text_range = {'type': 'FIXED_RANGE', 'startIndex': paragraph_start_index, 'endIndex': paragraph_end_index}
+
+            if 'style' in text_element['paragraphMarker']:
+                paragraph_style = text_element['paragraphMarker'].get('style', {})
+
+                styles_to_apply = {}
+                potential_p_styles = ['alignment', 'lineSpacing', 'spaceAbove', 'spaceBelow', 'direction']
+
+                for key in potential_p_styles:
+                    if key in paragraph_style:
+                        if allowed_fields is None or key in allowed_fields:
+                            styles_to_apply[key] = paragraph_style[key]
+
+                if styles_to_apply:
+                    request_body = {
+                        'objectId': object_id, 'style': styles_to_apply,
+                        'textRange': text_range, 'fields': ",".join(_create_recursive_field_mask(styles_to_apply))
+                    }
+                    if cell_location: request_body['cellLocation'] = cell_location
+                    requests.append({'updateParagraphStyle': request_body})
+
+            # Bullets are only applied if allowed_fields is None (Full Update)
+            # or if explicitly allowed (unlikely for this use case).
+            if 'bullet' in text_element['paragraphMarker'] and allowed_fields is None:
+                request_body = {
+                    'objectId': object_id, 'textRange': text_range,
+                    'bulletPreset': 'BULLET_DISC_CIRCLE_SQUARE'
+                }
+                if cell_location: request_body['cellLocation'] = cell_location
+                requests.append({'createParagraphBullets': request_body})
+
+            last_paragraph_end = paragraph_end_index
+
+    return requests
+# ----------------------------------------------------
+
+def _create_recursive_field_mask(properties, parent_key=''):
+    """
+    Recursively traverses a dictionary to create a dot-notated field mask,
+    filtering out read-only fields at any nesting level.
+    """
+    mask_paths = []
+    # Per the API docs, these fields are read-only and must be excluded from update masks.
+    READ_ONLY_FIELDS = ['placeholder', 'propertyState', 'type']
+
+    for key, value in properties.items():
+        # Skip any field that is read-only, regardless of its depth.
+        if key in READ_ONLY_FIELDS:
+            continue
+
+        current_key = f"{parent_key}.{key}" if parent_key else key
+
+        if isinstance(value, dict):
+            mask_paths.extend(_create_recursive_field_mask(value, parent_key=current_key))
+        else:
+            # We only add the path if it's a leaf node.
+            mask_paths.append(current_key)
+
+    return mask_paths
 # -------------------------------------------------------------------------
 
 # --- HELPER: Extracts text content from any element (Shape, Table Cell) ---
@@ -391,10 +473,11 @@ def get_text_content_from_element(element):
         for text_element in text_obj['textElements']:
             if 'textRun' in text_element:
                 full_text += text_element['textRun'].get('content', '')
+            elif 'autoText' in text_element:
+                # Auto text content is often None, but represents a character for indexing
+                full_text += text_element['autoText'].get('content', ' ')
             elif 'paragraphMarker' in text_element:
-                # Append newline to simulate structure breaks
-                if full_text and not full_text.endswith('\n'):
-                     full_text += '\n'
+                full_text += '\n'
                          
     return full_text.strip()
 # -----------------------------------------------------------------------
@@ -494,180 +577,185 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
 # --- COPY & SYNC LOGIC (WITH KEYWORD DEBUGGING) ---
 
 def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pres_id, dest_slide_id, master_slide_json, drive_service, docai_client, storage_client):
-    """Performs three-way synchronization (Delete/Add/Update)."""
-    requests = []
+    """
+    Analyzes master and destination slides to generate API requests.
+    1.  Structural: Creates/deletes objects.
+    2.  Formatting: Applies styles and text.
+    3.  ID Map: Returns a map of master-to-destination IDs for pre-existing objects.
+    """
+    structural_requests, formatting_requests, existing_id_map = [], [], {}
     logging.info(f"Starting object synchronization for Slide ID: {dest_slide_id}")
     
     try:
-        dest_slide_json = slides_service.presentations().pages().get(
-            presentationId=dest_pres_id, pageObjectId=dest_slide_id, fields='pageElements'
-        ).execute()
+        dest_slide_json = slides_service.presentations().pages().get(presentationId=dest_pres_id, pageObjectId=dest_slide_id).execute()
         dest_elements = dest_slide_json.get('pageElements', [])
     except HttpError as e:
-        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return []
+        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return [], [], {}
+
+    # Helper to determine if an element (shape) has actual text content.
+    def _element_has_text(element):
+        element_type_key = next((k for k in element if k not in ['objectId', 'size', 'transform', 'elementProperties']), None)
+        if not element_type_key: return False
+        text_elements = element.get(element_type_key, {}).get('text', {}).get('textElements', [])
+        return any('textRun' in te and te.get('textRun', {}).get('content', '').strip() for te in text_elements)
+
+    # Build a set of destination object IDs that already contain text to be deleted.
+    dest_elements_with_text = {el['objectId'] for el in dest_elements if _element_has_text(el)}
 
     master_elements = master_slide_json.get('pageElements', [])
 
-    # PHASE 1: DELETE MISSING OBJECTS
-    logging.debug(f"Phase 1: Checking {len(dest_elements)} destination elements for deletion.")
+    # Phase 1A: DELETE objects from destination that are not in the master.
+    logging.debug(f"Phase 1A: Checking {len(dest_elements)} destination elements for deletion.")
     for dest_element in dest_elements:
         if not find_master_match(dest_element, master_elements):
-            requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
+            structural_requests.append({'deleteObject': {'objectId': dest_element['objectId']}})
+            logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
 
-    # PHASE 2 & 3: ADD NEW OR UPDATE EXISTING OBJECTS
-    logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
+    # Phase 1B: CREATE master objects that are not in the destination and MAP existing ones.
+    logging.debug(f"Phase 1B: Checking {len(master_elements)} elements for creation and ID mapping.")
     for master_element in master_elements:
+        dest_match_id = find_master_match(master_element, dest_elements)
+        if not dest_match_id:
+            new_element_id = master_element['objectId']
+            element_type = next((k for k in master_element if k not in ('objectId', 'size', 'transform')), None)
+            if not element_type: continue
 
-        # --- CORRECTLY DETERMINE element_type ---
-        element_id = master_element['objectId']
-        TYPE_KEYS = ('objectId', 'size', 'transform') # Keys to ignore when finding the type
+            element_properties = {'pageObjectId': dest_slide_id}
+            if size := copy.deepcopy(master_element.get('size')):
+                if 'width' in size: size['width']['magnitude'], size['width']['unit'] = round(convert_emu_to_pt(size['width'].get('magnitude', 0), size['width'].get('unit', 'EMU'))[0], 3), 'PT'
+                if 'height' in size: size['height']['magnitude'], size['height']['unit'] = round(convert_emu_to_pt(size['height'].get('magnitude', 0), size['height'].get('unit', 'EMU'))[0], 3), 'PT'
+                element_properties['size'] = size
 
-        element_type = None
-        for key in master_element.keys():
-            if key not in TYPE_KEYS:
-                element_type = key # e.g., 'shape', 'image', 'table'
-                break
+            if transform := copy.deepcopy(master_element.get('transform')):
+                if 'translateX' in transform: transform['translateX'], _ = convert_emu_to_pt(transform['translateX'], 'EMU')
+                if 'translateY' in transform: transform['translateY'], _ = convert_emu_to_pt(transform['translateY'], 'EMU')
+                transform['unit'] = 'PT'
+                element_properties['transform'] = transform
 
-        if not element_type:
-            logging.warning(f"UNHANDLED: Could not determine type for object ID {element_id}. Skipping.")
-            continue
-        # ---------------------------------------------
-
-        # Existence Check - See if the master element already exists in the destination
-        matching_dest_id = find_master_match(master_element, dest_elements) # Define variable
-
-        # --- DIMENSIONAL CONVERSION AND UNIT ENFORCEMENT ---
-        # *** INITIALIZE element_properties BEFORE USE ***
-        element_properties = {'pageObjectId': dest_slide_id}
-
-        master_size = copy.deepcopy(master_element.get('size', {}))
-        if master_size:
-            if master_size.get('width'):
-                mag, unit = convert_emu_to_pt(master_size['width'].get('magnitude', 0), master_size['width'].get('unit', 'EMU'))
-                master_size['width']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['width']['unit'] = 'PT'
-            if master_size.get('height'):
-                mag, unit = convert_emu_to_pt(master_size['height'].get('magnitude', 0), master_size['height'].get('unit', 'EMU'))
-                master_size['height']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['height']['unit'] = 'PT'
-
-        master_transform = copy.deepcopy(master_element.get('transform', {}))
-        if master_transform:
-            if 'translateX' in master_transform:
-                master_transform['translateX'], _ = convert_emu_to_pt(master_transform['translateX'], 'EMU')
-                master_transform['translateX'] = round(master_transform['translateX'], 3)
-            if 'translateY' in master_transform:
-                master_transform['translateY'], _ = convert_emu_to_pt(master_transform['translateY'], 'EMU')
-                master_transform['translateY'] = round(master_transform['translateY'], 3)
-            master_transform['unit'] = 'PT'
-
-        if master_size and (master_size.get('width') or master_size.get('height')): element_properties['size'] = master_size
-        if master_transform and ('translateX' in master_transform or 'translateY' in master_transform or 'unit' in master_transform): element_properties['transform'] = master_transform
-
-
-        # --------------------------------------------------------------------------------
-        # FIX: OCR CALL INTEGRATION (Guaranteed execution path for images)
-        # --------------------------------------------------------------------------------
-        if element_type == 'image':
-            logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
-
-            if extracted_text:
-                logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
-
-                # Append the extracted text as a shape/text-element structure for validation processing
-                # We use the current hardcoded format string for this standalone validation call
-                keyword_metadata = process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, [{'text': {'textElements': [{'textRun': {'content': extracted_text}}]}}], "Format 1: Row 0/Col 0 Headers")
-                GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
-            else:
-                logging.warning("OCR_RESULT: Image processing returned no readable text.")
-        # --------------------------------------------------------------------------------
-
-
-        if matching_dest_id:
-            # --- ACTION: UPDATE EXISTING OBJECT (Skipped in this baseline) ---
-            target_id = matching_dest_id
-            logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
-
-            GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
-
+            create_request = None
+            if element_type == 'shape': create_request = {'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}}
+            elif element_type == 'image': create_request = {'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}}
+            elif element_type == 'table': create_request = {'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}}
+            if create_request: structural_requests.append(create_request)
         else:
-            # --- ACTION: ADD NEW OBJECT (Creation Logic) ---
-            new_element_id = uuid.uuid4().hex
-            logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
+            existing_id_map[master_element['objectId']] = dest_match_id
 
-            # Creation Request Body
-            create_request_body = {
-                'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
-            } if element_type == 'shape' else {
-                'createImage': {'url': master_element['image']['contentUrl'], 'elementProperties': element_properties}
-            } if element_type == 'image' else {
-                'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
-            }
+    # Phase 2: Generate formatting requests using MASTER IDs as placeholders.
+    logging.debug(f"Phase 2: Checking {len(master_elements)} master elements for formatting.")
+    for master_element in master_elements:
+        master_id = master_element['objectId']
+        element_type = next((k for k in master_element if k not in ('objectId', 'size', 'transform')), None)
 
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
+        if element_type == 'image':
+            if ocr_elements := process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, master_pres_id, master_slide_id):
+                GLOBAL_METADATA['Keyword_Values'].extend(process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, ocr_elements, "Format 1: Row 0/Col 0 Headers"))
 
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
-            requests.append(create_request_body)
+        if element_type == 'shape' and (props := master_element.get('shape', {}).get('shapeProperties')):
+            # Added contentAlignment to the allowed shape properties
+            styles_to_apply = {k: props[k] for k in ('shapeBackgroundFill', 'outline', 'contentAlignment') if k in props}
+            if styles_to_apply:
+                formatting_requests.append({'updateShapeProperties': {'objectId': master_id, 'shapeProperties': styles_to_apply, 'fields': ",".join(_create_recursive_field_mask(styles_to_apply))}})
 
-            # Apply basic text content (without styling update requests)
-            if element_type == 'shape' or element_type == 'table':
-                target_id = new_element_id
-                if 'text' in master_element:
-                    full_text = get_text_content_from_element(master_element)
-                    if full_text.strip():
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+        if master_element.get(element_type, {}).get('text'):
+            text_elements = master_element[element_type]['text']['textElements']
+            dest_match_id = existing_id_map.get(master_id)
+            is_existing_object = bool(dest_match_id)
 
-            GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
+            if element_type == 'table':
+                dest_table_element = None
+                if dest_match_id:
+                    dest_table_element = next((el for el in dest_elements if el['objectId'] == dest_match_id), None)
+                formatting_requests.extend(process_table_for_replication(master_id, dest_pres_id, dest_slide_id, master_element, dest_table_element, is_existing_object))
 
-    logging.info(f"Finished synchronization. Generated {len(requests)} batch requests.")
-    return requests
+            elif element_type == 'shape':
+                # Determine fields to update based on whether object is new or existing
+                allowed_text_fields = None
+                if is_existing_object:
+                    # For EXISTING objects: Only Foreground Color and Alignment. NO Text Copy.
+                    allowed_text_fields = {'foregroundColor', 'alignment'}
+
+                # Only Insert/Delete text for NEW objects
+                if not is_existing_object:
+                    has_actual_text = any(
+                        'textRun' in te and te.get('textRun', {}).get('content', '').strip()
+                        for te in text_elements
+                    )
+
+                    if has_actual_text:
+                        # This path is only for New Objects, so deletion is redundant but harmless (new obj is empty)
+                        # However, we retain logic for robustness if we ever allow mixed updates
+                        if dest_match_id and dest_match_id in dest_elements_with_text:
+                             formatting_requests.append({'deleteText': {'objectId': master_id, 'textRange': {'type': 'ALL'}}})
+
+                        full_text = get_text_content_from_element(master_element)
+                        if full_text.endswith('\n'):
+                            full_text = full_text[:-1]
+
+                        if full_text:
+                            formatting_requests.append({'insertText': {'objectId': master_id, 'text': full_text}})
+
+                # Apply formatting (Full for New, Partial for Existing)
+                formatting_requests.extend(generate_text_formatting_requests(master_id, text_elements, allowed_fields=allowed_text_fields))
+
+    logging.info(f"Finished sync analysis. Generated {len(structural_requests)} structural, {len(formatting_requests)} formatting requests.")
+    return structural_requests, formatting_requests, existing_id_map
 
 # --- Helper Functions for Text/Table Processing ---
 
-def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element):
-    """Generates requests for table content, merging, and metadata (Simplified)."""
-    requests = []; metadata = []; table_prop = table_element['table']; rows = table_prop['rows']; cols = table_prop['columns']
-    logging.debug(f"Processing Table {table_id} content and metadata.")
+def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_element, dest_table_element=None, is_existing_object=False):
+    """
+    Generates API requests to replicate the text content and styling for each
+    cell in a master table.
+    """
+    requests = []
+    table_prop = table_element['table']
+    rows, cols = table_prop['rows'], table_prop['columns']
+
+    def _cell_has_text(cell):
+        text_elements = cell.get('text', {}).get('textElements', [])
+        return any('textRun' in te and te.get('textRun', {}).get('content', '').strip() for te in text_elements)
+
+    logging.debug(f"Processing Table {table_id} text content and styling.")
     
+    allowed_text_fields = None
+    if is_existing_object:
+        allowed_text_fields = {'foregroundColor', 'alignment'}
+
     for r_idx in range(rows):
         for c_idx in range(cols):
             try:
-                # Extract text content from the master element cell
-                cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]; cell_content = get_text_content_from_element(cell).strip()
+                master_cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]
                 
-                if cell_content:
-                    # 1. Delete existing text (clean cell for insert)
-                    delete_text_request = {
-                        'deleteText': {
-                            'objectId': table_id,
-                            'cellLocation': {'rowIndex': r_idx, 'columnIndex': c_idx},
-                            'textRange': {'type': 'ALL'}
-                        }
-                    }
-                    requests.append(delete_text_request)
-
-                    # 2. Insert new text
-                    insert_text_request = {
-                        'insertText': {
-                            'objectId': table_id,
-                            'cellLocation': {'rowIndex': r_idx, 'columnIndex': c_idx},
-                            'text': cell_content
-                        }
-                    }
-                    requests.append(insert_text_request)
+                if _cell_has_text(master_cell):
+                    cell_location = {'rowIndex': r_idx, 'columnIndex': c_idx}
                     
+                    # Only perform Text Copy operations if it is a NEW object
+                    if not is_existing_object:
+                        # Check if the corresponding destination cell has text that needs to be cleared.
+                        if dest_table_element:
+                             try:
+                                 dest_cell = dest_table_element['table']['tableRows'][r_idx]['tableCells'][c_idx]
+                                 if _cell_has_text(dest_cell):
+                                     requests.append({'deleteText': {'objectId': table_id, 'cellLocation': cell_location, 'textRange': {'type': 'ALL'}}})
+                             except (KeyError, IndexError):
+                                 pass # Destination table is smaller or cell doesn't exist; no need to delete.
+
+                        cell_content = get_text_content_from_element(master_cell)
+                        if cell_content.endswith('\n'):
+                            cell_content = cell_content[:-1]
+
+                        if cell_content:
+                            requests.append({'insertText': {'objectId': table_id, 'cellLocation': cell_location, 'text': cell_content}})
+
+                    # Apply Formatting (Full or Partial)
+                    if master_cell.get('text', {}).get('textElements'):
+                        requests.extend(generate_text_formatting_requests(table_id, master_cell['text']['textElements'], cell_location, allowed_fields=allowed_text_fields))
+
             except Exception as e:
-                logging.warning(f"Error parsing table cell {r_idx},{c_idx}: {e}")
-    logging.debug("Completed table content parsing.")
-    return requests, metadata
+                logging.warning(f"Error parsing table cell {r_idx},{c_idx} for text/style replication: {e}")
+
+    logging.debug(f"Generated {len(requests)} text and style requests for table {table_id}.")
+    return requests
 
 
 def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers"):
@@ -884,23 +972,83 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                         
                     master_slide_id = master_slide['objectId']; dest_slide = dest_pres['slides'][i]; dest_slide_id = dest_slide['objectId']
                     
-                    # Run Copy/Delete sync logic
-                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client)
+                    structural_reqs, formatting_reqs, existing_id_map = copy_slide_content(
+                        slides_service, master_slide_id, master_id, dest_id, dest_slide_id,
+                        master_slide, drive_service, docai_client, storage_client
+                    )
                     
-                    # Run validation logic on existing content in destination
-                    dest_slide_elements = dest_slide.get('pageElements', [])
+                    # This final_id_map will hold ALL master-to-destination mappings.
+                    final_id_map = existing_id_map.copy()
+                    logging.debug(f"ID_MAP_INIT: Started with {len(final_id_map)} pre-existing object mappings.")
 
-                    # Call validation using the table_format argument
+                    # --- Execute Structural Changes ---
+                    if structural_reqs:
+                        try:
+                            response = slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': structural_reqs}).execute()
+
+                            # --- Update the ID map with newly created object IDs ---
+                            replies = response.get('replies', [])
+                            create_requests = [(i, req) for i, req in enumerate(structural_reqs) if 'create' in next(iter(req))]
+                            for i, req in create_requests:
+                                if i < len(replies):
+                                    action_key = next(iter(req))
+                                    master_id_val = req[action_key].get('objectId')
+                                    if action_key in replies[i] and (new_id := replies[i][action_key].get('objectId')):
+                                        final_id_map[master_id_val] = new_id
+                                        logging.debug(f"ID_MAP_CREATE: Mapped new master ID '{master_id_val}' -> '{new_id}'")
+
+                            logging.info(f"Structural updates applied. Final ID map has {len(final_id_map)} entries.")
+
+                        except HttpError as e:
+                            logging.error(f"STRUCTURAL BatchUpdate failed on slide {i+1}: {e}"); total_inconsistencies += 1; continue
+
+                    # --- Remap and Execute Formatting Changes ---
+                    if formatting_reqs:
+                        for req in formatting_reqs:
+                            action_key = next(iter(req))
+                            if 'objectId' in req[action_key]:
+                                master_obj_id = req[action_key]['objectId']
+                                if master_obj_id in final_id_map:
+                                    req[action_key]['objectId'] = final_id_map[master_obj_id]
+                                else:
+                                    logging.warning(f"ID_REMAP_FAIL: Master object ID {master_obj_id} not found in final map. Formatting may fail.")
+
+
+                        logging.debug(f"Executing BatchUpdate with {len(formatting_reqs)} remapped FORMATTING requests.")
+
+                        # --- Enhanced Per-Request Logging ---
+                        logging.debug("--- START: Individual Formatting Requests ---")
+                        for idx, req in enumerate(formatting_reqs):
+                            logging.debug(f"  Request [{idx+1}/{len(formatting_reqs)}]: {json.dumps(req, indent=2)}")
+                        logging.debug("--- END: Individual Formatting Requests ---")
+                        # ------------------------------------
+
+                        try:
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': formatting_reqs}).execute()
+                            logging.info(f"Applied {len(formatting_reqs)} formatting batch updates successfully.")
+                        except HttpError as e:
+                            logging.error(f"--- START: FORMATTING BATCHUPDATE FAILURE (Slide {i+1} of {dest_name}) ---")
+                            logging.error(f"  Raw Error Content: {e.content.decode()}")
+                            try:
+                                error_details = json.loads(e.content.decode())
+                                failing_requests = error_details.get("error", {}).get("details", [{}])[0].get("badRequest", {}).get("invalidRequests", [])
+                                if failing_requests:
+                                    logging.error("  --- Failing Request Payloads ---")
+                                    for req_info in failing_requests:
+                                        logging.error(json.dumps(req_info, indent=2))
+                                    logging.error("  ---------------------------------")
+                                else:
+                                     logging.error("  Could not extract specific failing requests from the error details.")
+                            except Exception as json_e:
+                                logging.error(f"  Could not parse JSON from HttpError content: {json_e}")
+                            logging.error(f"  Full Error Traceback: {e}")
+                            logging.error(f"--- END: FORMATTING BATCHUPDATE FAILURE ---")
+                            total_inconsistencies += 1
+
+                    # Run validation logic on the updated content in the destination slide
+                    dest_slide_elements = dest_slide.get('pageElements', [])
                     keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
                     GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
-                    
-                    if copy_requests:
-                        logging.debug(f"Executing BatchUpdate with {len(copy_requests)} requests.")
-                        try:
-                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': copy_requests}).execute()
-                            logging.info(f"Applied {len(copy_requests)} batch updates to slide {i+1} successfully.")
-                        except HttpError as e:
-                            logging.error(f"BatchUpdate failed on {dest_name}, slide {i+1}: {e}"); total_inconsistencies += 1
 
                 except Exception as e:
                     logging.error(f"CRITICAL PARSING ERROR in Slide {i+1} of {dest_name}. Traceback: {e}"); total_inconsistencies += 1
