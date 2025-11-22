@@ -281,10 +281,11 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         creds = slides_service._http.credentials
 
         # Request the thumbnail URL for the specific image element within the presentation
+        # Note: getThumbnail gets the whole page. elementId is not supported in standard v1 API for this method.
+        # We fallback to page thumbnail which might include more text than just the image.
         response = slides_service.presentations().pages().getThumbnail(
             presentationId=presentation_id,
             pageObjectId=page_id,
-            elementId=image_obj_id,
             thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
         ).execute()
 
@@ -454,7 +455,7 @@ def _create_recursive_field_mask(properties, parent_key=''):
     """
     mask_paths = []
     # Per the API docs, these fields are read-only and must be excluded from update masks.
-    READ_ONLY_FIELDS = ['placeholder', 'propertyState', 'type']
+    READ_ONLY_FIELDS = ['placeholder', 'propertyState', 'type', 'fontScale', 'lineSpacingReduction']
 
     for key, value in properties.items():
         # Skip any field that is read-only, regardless of its depth.
