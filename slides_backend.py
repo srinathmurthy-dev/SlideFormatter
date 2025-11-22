@@ -260,6 +260,32 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
+def _get_text_from_docai_layout(layout, full_text):
+    """Extracts text from the document's full text based on a layout's text anchor."""
+    if layout and layout.text_anchor and layout.text_anchor.text_segments:
+        return "".join([full_text[segment.start_index:segment.end_index] for segment in layout.text_anchor.text_segments])
+    return ""
+
+def _convert_docai_table_to_slides_format(docai_table, full_text):
+    """Converts a Document AI table object into a dictionary that mimics the Google Slides API table structure."""
+    all_rows = list(docai_table.header_rows) + list(docai_table.body_rows)
+    if not all_rows: return None
+
+    num_rows, num_cols = len(all_rows), max((len(row.cells) for row in all_rows), default=0)
+    table_rows_data = []
+
+    for row in all_rows:
+        table_cells = []
+        for cell in row.cells:
+            cell_text = _get_text_from_docai_layout(cell.layout, full_text).strip().replace('\n', ' ')
+            table_cells.append({'text': {'textElements': [{'textRun': {'content': cell_text}}]}})
+        table_rows_data.append({'tableCells': table_cells})
+
+    return {
+        'objectId': f"ocr_table_{uuid.uuid4().hex[:8]}",
+        'table': {'rows': num_rows, 'columns': num_cols, 'tableRows': table_rows_data}
+    }
+
 def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, presentation_id, page_id):
     """Processes an image, detects tables, and returns a list of fake 'page element' objects for validation."""
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
