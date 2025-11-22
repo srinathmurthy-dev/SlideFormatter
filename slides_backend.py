@@ -283,10 +283,12 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         # Request the thumbnail URL for the specific image element within the presentation
         # Note: getThumbnail gets the whole page. elementId is not supported in standard v1 API for this method.
         # We fallback to page thumbnail which might include more text than just the image.
+        # Note: Python client flattens nested properties.
         response = slides_service.presentations().pages().getThumbnail(
             presentationId=presentation_id,
             pageObjectId=page_id,
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
+            thumbnailProperties_thumbnailSize='LARGE',
+            thumbnailProperties_mimeType='PNG'
         ).execute()
 
         thumbnail_url = response.get('contentUrl')
