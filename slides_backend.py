@@ -413,7 +413,11 @@ def generate_text_formatting_requests(object_id, text_elements, cell_location=No
                 paragraph_style = text_element['paragraphMarker'].get('style', {})
 
                 styles_to_apply = {}
-                potential_p_styles = ['alignment', 'lineSpacing', 'spaceAbove', 'spaceBelow', 'direction']
+                # Added indentation fields to fix text positioning
+                potential_p_styles = [
+                    'alignment', 'lineSpacing', 'spaceAbove', 'spaceBelow', 'direction',
+                    'indentStart', 'indentEnd', 'indentFirstLine'
+                ]
 
                 for key in potential_p_styles:
                     if key in paragraph_style:
@@ -667,8 +671,8 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 GLOBAL_METADATA['Keyword_Values'].extend(process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, ocr_elements, "Format 1: Row 0/Col 0 Headers"))
 
         if element_type == 'shape' and (props := master_element.get('shape', {}).get('shapeProperties')):
-            # Added contentAlignment to the allowed shape properties
-            styles_to_apply = {k: props[k] for k in ('shapeBackgroundFill', 'outline', 'contentAlignment') if k in props}
+            # Added contentAlignment and autofit to the allowed shape properties to fix text sizing/positioning
+            styles_to_apply = {k: props[k] for k in ('shapeBackgroundFill', 'outline', 'contentAlignment', 'autofit') if k in props}
             if styles_to_apply:
                 formatting_requests.append({'updateShapeProperties': {'objectId': master_id, 'shapeProperties': styles_to_apply, 'fields': ",".join(_create_recursive_field_mask(styles_to_apply))}})
 
