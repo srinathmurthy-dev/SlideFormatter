@@ -413,33 +413,22 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
     col_headers = []
 
     if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
-        # Format 2:
-        # Row 0: Month/Period (e.g., "Feb-25")
-        # Row 1: Metric (e.g., "Actual")
-        # Row 2, Col 0: Prefix/Data Element (e.g., "Net Revenue")
-        # Row 3+: Data Rows
-        
-        # Extract Prefix from Row 2 (Index 1), Col 0 (if exists)
-        prefix = ""
-        if rows > 1:
-             prefix = get_text_content_from_element(table_rows[1]['tableCells'][0]).strip()
+        # Format 2: Combines Row 0 and Row 1 text for column header labels (e.g., 'Q3 - Actual')
 
-        # Column Headers: Combine Prefix, Row 1, and Row 0
+        # Column Headers: Combine Row 0 and Row 1 content (skipping cell 0,0 and 1,0)
         if rows >= 2:
             row_0_cells = table_rows[0]['tableCells']
             row_1_cells = table_rows[1]['tableCells']
             
             for c_idx in range(1, cols):
-                header_row0 = get_text_content_from_element(row_0_cells[c_idx]).strip()
-                header_row1 = get_text_content_from_element(row_1_cells[c_idx]).strip()
+                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
+                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
                 
-                # Keyword Construction: "{Prefix}, {Row 1}, {Row 0}"
-                # Example: "Net Revenue, Actual, Feb-25"
-                parts = [p for p in [prefix, header_row1, header_row0] if p]
-                combined_header = ", ".join(parts)
+                # The combined header is the unique identifier (keyword)
+                combined_header = f"{header_p1} - {header_p2}" if header_p1 and header_p2 else header_p1 or header_p2 or f"[Empty Col Header {c_idx}]"
                 col_headers.append(combined_header)
 
-        # Row Headers: Taken from Column 0 (starting from row 3 -> Index 2)
+        # Row Headers: Taken from Column 0 (starting from row 2, skipping 0 and 1)
         for r_idx in range(2, rows):
             row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row Header {r_idx}]")
 
@@ -474,7 +463,6 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
     logging.debug(f"TABLE_HEADERS: Slide ID: {dest_slide_id}. Column Headers: {col_headers}")
 
     # Determine starting row for data cells
-    # Format 2 starts at Row 3 (index 2). Format 1 starts at Row 1 (index 1).
     data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
 
     # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
