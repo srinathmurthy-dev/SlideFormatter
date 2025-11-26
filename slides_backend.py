@@ -248,46 +248,31 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, docai_client, storage_client):
+    """Downloads image via contentUrl (no API call) and processes via DocAI."""
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
     blob = None
 
     try:
-        # CRITICAL DEBUGGING PRINTS
-        logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
-        logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
+        # 1. Get Image Content URL directly from element properties
+        image_url = image_element.get('image', {}).get('contentUrl')
+        if not image_url:
+            logging.warning("OCR_SKIPPED: No contentUrl found in image element.")
+            return ""
 
-        # 1. Download image data using the reliable Slides API thumbnail method
-        image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
+        logging.debug(f"OCR_STEP: Downloading image from contentUrl...")
 
-        # Get the credentials for authenticated request
-        creds = slides_service._http.credentials
-
-        # Request the thumbnail URL for the specific image element within the presentation
-        response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id,
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            thumbnailProperties_thumbnailSize='LARGE',
-            thumbnailProperties_mimeType='PNG'
-        ).execute()
-
-        thumbnail_url = response.get('contentUrl')
-        logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
-
-        # Use authenticated credentials to perform an HTTP GET request
-        response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
+        # Download the image (contentUrl is typically a signed, short-lived public URL)
+        response = requests.get(image_url)
         
         if response.status_code == 200:
             image_bytes = response.content
-            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes.")
         else:
-            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
-            return extracted_text # Return empty text if download fails
+            logging.error(f"OCR_ERROR: Failed to download image from contentUrl. Status: {response.status_code}.")
+            return ""
 
         # 2. Upload to GCS
         bucket = storage_client.bucket(GCS_BUCKET_NAME); blob = bucket.blob(temp_filename)
@@ -582,8 +567,8 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         # --------------------------------------------------------------------------------
         if element_type == 'image':
             logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
+            # The function is invoked here! (Now using contentUrl, so no extra service args needed)
+            extracted_text = process_image_ocr(master_element, docai_client, storage_client)
 
             if extracted_text:
                 logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
