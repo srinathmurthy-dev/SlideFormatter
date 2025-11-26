@@ -271,8 +271,8 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         response = slides_service.presentations().pages().getThumbnail(
             presentationId=dest_pres_id,
             pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id,
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
+            thumbnailProperties_thumbnailSize='LARGE',
+            thumbnailProperties_mimeType='PNG'
         ).execute()
 
         thumbnail_url = response.get('contentUrl')
@@ -413,19 +413,31 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
     col_headers = []
 
     if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
-        # Format 2: Combines Row 0 and Row 1 text for column header labels (e.g., 'Q3 - Actual')
+        # Format 2: Combines Row 0 and Row 1 text for column header labels
+        # PLUS uses Row 2, Col 1 (Index 1, 0) as a global prefix.
 
-        # Column Headers: Combine Row 0 and Row 1 content (skipping cell 0,0 and 1,0)
+        prefix = ""
+        # Safety check for sufficient rows
+        if rows >= 2:
+            try:
+                # Get prefix from Row 2, Column 1 (Index 1, Index 0)
+                prefix = get_text_content_from_element(table_rows[1]['tableCells'][0]).split('\n')[0].strip()
+            except Exception:
+                pass
+
         if rows >= 2:
             row_0_cells = table_rows[0]['tableCells']
             row_1_cells = table_rows[1]['tableCells']
             
             for c_idx in range(1, cols):
-                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
-                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
+                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip() # Row Index 0
+                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip() # Row Index 1
+
+                # Format: "{Prefix}, {Row 1 Header}, {Row 0 Header}"
+                # Filter out empty strings
+                parts = [p for p in [prefix, header_p2, header_p1] if p]
+                combined_header = ", ".join(parts) if parts else f"[Empty Col Header {c_idx}]"
                 
-                # The combined header is the unique identifier (keyword)
-                combined_header = f"{header_p1} - {header_p2}" if header_p1 and header_p2 else header_p1 or header_p2 or f"[Empty Col Header {c_idx}]"
                 col_headers.append(combined_header)
 
         # Row Headers: Taken from Column 0 (starting from row 2, skipping 0 and 1)
@@ -694,6 +706,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
             row_headers, col_headers = _get_table_headers(element, table_format)
             
             # Determine starting row for data cells
+            # For Format 2: Data starts at Row 3 (Index 2)
             data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
 
             # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
