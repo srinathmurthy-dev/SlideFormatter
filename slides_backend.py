@@ -332,6 +332,22 @@ def convert_emu_to_pt(magnitude, original_unit):
     return magnitude, original_unit
 # ------------------------------
 
+# --- HELPER: GENERATE FIELD MASK ---
+def generate_field_mask(properties, parent_key=''):
+    """Generates a comma-separated field mask from a dictionary of properties."""
+    paths = []
+    for key, value in properties.items():
+        # Handle snake_case to camelCase mapping if keys are mixed, but usually properties are camelCase.
+        # Here we assume the input dictionary keys exactly match the API field names.
+        current_path = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+             # Recursively generate paths for nested dictionaries
+            paths.append(generate_field_mask(value, current_path))
+        else:
+            paths.append(current_path)
+    return ",".join(paths)
+# ------------------------------
+
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
 def generate_text_style_requests(object_id, text_elements, cell_location=None):
     return []
@@ -597,7 +613,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            # Creation Request Body
+            # 1. Base Creation Request (WITHOUT STYLING PROPERTIES)
             create_request_body = {
                 'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
             } if element_type == 'shape' else {
@@ -605,18 +621,40 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             } if element_type == 'image' else {
                 'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
             }
-            
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
-
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
             requests.append(create_request_body)
+
+            # 2. Separate Update Request for Styling (with Field Mask)
+            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+                cleaned_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateShapeProperties': {
+                            'objectId': new_element_id,
+                            'shapeProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    requests.append(update_request)
+
+            elif element_type == 'image' and 'imageProperties' in master_element['image']:
+                cleaned_props = scrub_read_only_fields(master_element['image']['imageProperties'])
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateImageProperties': {
+                            'objectId': new_element_id,
+                            'imageProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    requests.append(update_request)
+
+            # Note: createTable doesn't support tableProperties in create, and there is no single updateTableProperties request.
+            # Table styling requires cell-level updates which are handled separately if needed.
             
+            logging.debug(f"RAW REQUEST JSON (create + update): {json.dumps(create_request_body, indent=2)}")
+
             # Apply basic text content (without styling update requests)
             if element_type == 'shape' or element_type == 'table':
                 target_id = new_element_id
