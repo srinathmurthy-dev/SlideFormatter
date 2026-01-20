@@ -248,7 +248,7 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, docai_client, storage_client):
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
@@ -258,36 +258,26 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         # CRITICAL DEBUGGING PRINTS
         logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
         logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
 
-        # 1. Download image data using the reliable Slides API thumbnail method
-        image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
+        # 1. Download image data directly from contentUrl (Robust Method)
+        # The contentUrl is valid for ~30 minutes and does not require a separate API call to getThumbnail.
+        thumbnail_url = image_element.get('image', {}).get('contentUrl')
 
-        # Get the credentials for authenticated request
-        creds = slides_service._http.credentials
+        if not thumbnail_url:
+            logging.warning("OCR_WARNING: No contentUrl found in image element. Skipping.")
+            return ""
 
-        # Request the thumbnail URL for the specific image element within the presentation
-        response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id,
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id,
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
-        ).execute()
+        logging.debug(f"OCR_STEP: Found contentUrl: {thumbnail_url[:80]}...")
 
-        thumbnail_url = response.get('contentUrl')
-        logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
-
-        # Use authenticated credentials to perform an HTTP GET request
-        response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
+        # Download the image directly
+        response = requests.get(thumbnail_url)
 
         if response.status_code == 200:
             image_bytes = response.content
-            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via contentUrl.")
         else:
-            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
-            return extracted_text # Return empty text if download fails
+            logging.error(f"OCR_ERROR: Failed to download image from contentUrl. Status: {response.status_code}.")
+            return extracted_text
 
         # 2. Upload to GCS
         bucket = storage_client.bucket(GCS_BUCKET_NAME); blob = bucket.blob(temp_filename)
@@ -330,6 +320,22 @@ def convert_emu_to_pt(magnitude, original_unit):
         return magnitude / EMU_PER_PT, 'PT'
     # If the magnitude is 0, or unit is already PT, assume it's correct.
     return magnitude, original_unit
+# ------------------------------
+
+# --- HELPER: GENERATE FIELD MASK ---
+def generate_field_mask(properties, parent_key=''):
+    """Generates a comma-separated field mask from a dictionary of properties."""
+    paths = []
+    for key, value in properties.items():
+        # Handle snake_case to camelCase mapping if keys are mixed, but usually properties are camelCase.
+        # Here we assume the input dictionary keys exactly match the API field names.
+        current_path = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+             # Recursively generate paths for nested dictionaries
+            paths.append(generate_field_mask(value, current_path))
+        else:
+            paths.append(current_path)
+    return ",".join(paths)
 # ------------------------------
 
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
@@ -570,8 +576,8 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         # --------------------------------------------------------------------------------
         if element_type == 'image':
             logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
+            # The function is invoked here! (Updated signature)
+            extracted_text = process_image_ocr(master_element, docai_client, storage_client)
 
             if extracted_text:
                 logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
@@ -597,7 +603,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            # Creation Request Body
+            # 1. Base Creation Request (WITHOUT STYLING PROPERTIES)
             create_request_body = {
                 'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
             } if element_type == 'shape' else {
@@ -605,17 +611,38 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             } if element_type == 'image' else {
                 'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
             }
-
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
-
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
             requests.append(create_request_body)
+
+            # 2. Separate Update Request for Styling (with Field Mask)
+            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+                cleaned_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateShapeProperties': {
+                            'objectId': new_element_id,
+                            'shapeProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    requests.append(update_request)
+
+            elif element_type == 'image' and 'imageProperties' in master_element['image']:
+                cleaned_props = scrub_read_only_fields(master_element['image']['imageProperties'])
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateImageProperties': {
+                            'objectId': new_element_id,
+                            'imageProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    requests.append(update_request)
+
+            # Note: createTable doesn't support tableProperties in create, and there is no single updateTableProperties request.
+
+            logging.debug(f"RAW REQUEST JSON (create + update): {json.dumps(create_request_body, indent=2)}")
 
             # Apply basic text content (without styling update requests)
             if element_type == 'shape' or element_type == 'table':
