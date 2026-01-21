@@ -469,11 +469,10 @@ def get_text_content_from_element(element):
             if 'textRun' in text_element:
                 full_text += text_element['textRun'].get('content', '')
             elif 'paragraphMarker' in text_element:
-                # Append newline to simulate structure breaks
-                if full_text and not full_text.endswith('\n'):
-                     full_text += '\n'
+                # Always append newline for paragraph markers to maintain index parity with API
+                full_text += '\n'
                          
-    return full_text.strip()
+    return full_text
 # -----------------------------------------------------------------------
 
 
@@ -688,11 +687,11 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             # 2. Separate Update Request for Styling (with Field Mask)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                # STRICT FILTERING: User requested only Background Color and Basic Content.
-                # We filter to keep only 'shapeBackgroundFill' and 'outline'.
+                # STRICT FILTERING: Background Color, Borders, and Vertical Alignment.
                 full_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
 
-                allowed_keys = {'shapeBackgroundFill', 'outline'}
+                # Add 'contentAlignment' to supported keys for vertical text alignment (TOP, MIDDLE, BOTTOM)
+                allowed_keys = {'shapeBackgroundFill', 'outline', 'contentAlignment'}
                 cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
 
                 if cleaned_props:
@@ -743,17 +742,14 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 if text_obj:
                     # 1. Insert Content (Structural Phase)
                     full_text = get_text_content_from_element(master_element)
-                    # Note: We strip() for insertion check, but for index alignment we might need raw text.
-                    # However, insertText usually works best with stripped input for shapes.
-                    # To match indices for styling, we rely on the fact that textElements cover the whole range.
 
                     if full_text.strip(): 
-                        # Use rstrip() to keep indentation if present but remove trailing newline which slides adds
+                        # Use rstrip() to remove the final newline (which the new shape already has implicitly),
+                        # but keep all other formatting (leading spaces, internal newlines) to match indices.
                         text_to_insert = full_text.rstrip('\n')
                         structural_requests.append({'insertText': {'objectId': target_id, 'text': text_to_insert}})
 
                         # 2. Apply Text Styling (Formatting Phase)
-                        # We only apply styling if content exists
                         if 'textElements' in text_obj:
                             style_reqs = generate_text_style_requests(target_id, text_obj['textElements'])
                             formatting_requests.extend(style_reqs)
