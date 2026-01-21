@@ -926,6 +926,25 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                             # Start value search just after the keyword/colon
                             match_end_index = anchor_match.end(); search_start = min(match_end_index, len(line))
                             
+                            # --- PREFIX/LABEL EXTRACTION ---
+                            # Capture text preceding the match (e.g., "Play Consumers: Y/Y" -> "Play Consumers")
+                            match_start_index = anchor_match.start()
+                            prefix_text = line[:match_start_index].strip()
+
+                            # Clean the prefix (remove trailing colons)
+                            prefix_label = prefix_text.rstrip(':').strip()
+
+                            # Construct the final display keyword
+                            # If a prefix exists, combine it: "Play Consumers: Y/Y"
+                            # Otherwise, stick to the base keyword.
+                            # We update 'product_area_label' to reflect this prefix for the metadata 'label' field too.
+                            if prefix_label:
+                                base_keyword_display = f"{prefix_label}: {keyword}"
+                                current_label = prefix_label
+                            else:
+                                base_keyword_display = keyword
+                                current_label = product_area_label
+
                             if is_dual_value:
                                 # DUAL VALUE CASE: Capture the rest of the line as the dual value
                                 value = line[search_start:].strip()
@@ -942,19 +961,21 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 
                                 # Log and add DOLLAR entry (e.g., YoY -> YoY $)
                                 if value_dollar:
-                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{keyword} $' Value='{value_dollar}' Confidence={conf:.4f}")
+                                    final_kw = f"{base_keyword_display} $"
+                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_dollar}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': f"{keyword} $", 'value': value_dollar,
+                                        'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_dollar,
                                         'confidence': conf
                                     })
                                 
                                 # Log and add PERCENT entry (e.g., YoY -> YoY %)
                                 if value_percent:
-                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{keyword} %' Value='{value_percent}' Confidence={conf:.4f}")
+                                    final_kw = f"{base_keyword_display} %"
+                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_percent}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': f"{keyword} %", 'value': value_percent,
+                                        'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_percent,
                                         'confidence': conf
                                     })
                             else:
@@ -965,11 +986,11 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                     conf = round(best_confidence, 4)
                                     
                                     # LOGGING: Successful match
-                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{keyword}' Value='{value}' Confidence={conf:.4f} in Line {line_idx+1}")
+                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{value}' Confidence={conf:.4f} in Line {line_idx+1}")
                                     
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': keyword, 'value': value,
+                                        'object_id': element_id, 'label': current_label, 'keyword': base_keyword_display, 'value': value,
                                         'confidence': conf
                                     })
                                 
