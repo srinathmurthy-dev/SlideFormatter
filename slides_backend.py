@@ -903,8 +903,12 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                     best_term = ""
 
                     for term in search_terms:
-                        # Fuzzy matching logic
-                        confidence = fuzz.partial_ratio(term.lower(), line.lower()) / 100.0
+                        # Optimization: Check for exact substring match first (Fast)
+                        if term.lower() in line.lower():
+                            confidence = 1.0
+                        else:
+                            # Fuzzy matching logic (Slower)
+                            confidence = fuzz.partial_ratio(term.lower(), line.lower()) / 100.0
                         
                         # LOGGING: Report every score
                         logging.debug(f"   MATCH_ATTEMPT: Slide ID: {dest_slide_id}. Line {line_idx+1}: '{line.strip()[:30]}...' -> Term '{term}' Score: {confidence:.4f}")
@@ -916,23 +920,28 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                     if best_confidence >= KEYWORD_CONFIDENCE_THRESHOLD:
                         
                         # --- DUAL-VALUE LOGIC CHECK ---
-                        # If the keyword does NOT end with '$' or '%', assume it's the combined dual value.
                         is_dual_value = not (best_term.endswith('$') or best_term.endswith('%'))
                         
                         # Find the actual keyword match location to anchor the value search
-                        anchor_match = re.search(r'\b(' + re.escape(best_term) + r'|' + re.escape(alias) + r')\s*[:\s]*', line, re.IGNORECASE)
+                        # Use simple string finding if regex fails or for speed
+                        match_start_index = line.lower().find(best_term.lower())
                         
-                        if anchor_match:
-                            # Start value search just after the keyword/colon
-                            match_end_index = anchor_match.end(); search_start = min(match_end_index, len(line))
-                            
+                        if match_start_index != -1:
+                            match_end_index = match_start_index + len(best_term)
+                            search_start = min(match_end_index, len(line))
+
+                            # Adjust search start if followed by colon/space (manual regex equivalent)
+                            while search_start < len(line) and line[search_start] in (':', ' '):
+                                search_start += 1
+
                             # --- PREFIX/LABEL EXTRACTION ---
                             # Capture text preceding the match (e.g., "Play Consumers: Y/Y" -> "Play Consumers")
-                            match_start_index = anchor_match.start()
                             prefix_text = line[:match_start_index].strip()
 
                             # Clean the prefix (remove trailing colons)
                             prefix_label = prefix_text.rstrip(':').strip()
+
+                            logging.debug(f"   PREFIX_DEBUG: Line='{line.strip()}' MatchIdx={match_start_index} Prefix='{prefix_label}'")
 
                             # Construct the final display keyword
                             # If a prefix exists, combine it: "Play Consumers: Y/Y"
