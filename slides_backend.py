@@ -340,11 +340,52 @@ def generate_field_mask(properties, parent_key=''):
 
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
 def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    """
-    DISABLED FOR DEBUGGING: Returns empty list to isolate background color issues.
-    User requested to enable just the background color and copy over of the text.
-    """
-    return []
+    """Generates UpdateTextStyle requests for specific text properties (Font Size Only)."""
+    requests = []
+
+    # Track current index
+    current_index = 0
+
+    for element in text_elements:
+        start_index = element.get('startIndex', 0)
+        end_index = element.get('endIndex', 0)
+
+        # Calculate range length
+        text_len = end_index - start_index
+        if text_len <= 0: continue
+
+        # --- 1. Text Style (Font Size) ---
+        if 'textRun' in element:
+            text_style = element['textRun'].get('style', {})
+
+            # Filter for requested fields: fontSize ONLY
+            update_style = {}
+            fields_mask = []
+
+            if 'fontSize' in text_style:
+                update_style['fontSize'] = text_style['fontSize']
+                fields_mask.append('fontSize')
+
+            if update_style:
+                req = {
+                    'updateTextStyle': {
+                        'objectId': object_id,
+                        'textRange': {
+                            'type': 'FIXED_RANGE',
+                            'startIndex': current_index,
+                            'endIndex': current_index + text_len
+                        },
+                        'style': update_style,
+                        'fields': ",".join(fields_mask)
+                    }
+                }
+                if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
+                requests.append(req)
+
+        # Advance our tracking index by the length of this element
+        current_index += text_len
+
+    return requests
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
