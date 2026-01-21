@@ -687,11 +687,12 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             # 2. Separate Update Request for Styling (with Field Mask)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                # STRICT FILTERING: Background Color, Borders, and Vertical Alignment.
+                # STRICT FILTERING: Background Color, Borders, Vertical Alignment, and Autofit.
                 full_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
 
-                # Add 'contentAlignment' to supported keys for vertical text alignment (TOP, MIDDLE, BOTTOM)
-                allowed_keys = {'shapeBackgroundFill', 'outline', 'contentAlignment'}
+                # Add 'autofit' to ensure text sizing behavior matches master.
+                # Add 'shapeBackgroundFill' explicitly.
+                allowed_keys = {'shapeBackgroundFill', 'outline', 'contentAlignment', 'autofit'}
                 cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
 
                 if cleaned_props:
