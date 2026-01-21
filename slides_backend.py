@@ -340,7 +340,77 @@ def generate_field_mask(properties, parent_key=''):
 
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
 def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    return []
+    """Generates UpdateTextStyle and UpdateParagraphStyle requests for specific text properties."""
+    requests = []
+
+    # Track current index
+    current_index = 0
+
+    for element in text_elements:
+        start_index = element.get('startIndex', 0)
+        end_index = element.get('endIndex', 0)
+
+        # Calculate range length
+        text_len = end_index - start_index
+        if text_len <= 0: continue
+
+        # --- 1. Text Style (Color, Font Size) ---
+        if 'textRun' in element:
+            text_style = element['textRun'].get('style', {})
+
+            # Filter for requested fields: foregroundColor, fontSize
+            update_style = {}
+            fields_mask = []
+
+            if 'foregroundColor' in text_style:
+                update_style['foregroundColor'] = text_style['foregroundColor']
+                fields_mask.append('foregroundColor')
+
+            if 'fontSize' in text_style:
+                update_style['fontSize'] = text_style['fontSize']
+                fields_mask.append('fontSize')
+
+            if update_style:
+                req = {
+                    'updateTextStyle': {
+                        'objectId': object_id,
+                        'textRange': {
+                            'type': 'FIXED_RANGE',
+                            'startIndex': current_index,
+                            'endIndex': current_index + text_len
+                        },
+                        'style': update_style,
+                        'fields': ",".join(fields_mask)
+                    }
+                }
+                if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
+                requests.append(req)
+
+        # --- 2. Paragraph Style (Alignment) ---
+        elif 'paragraphMarker' in element:
+            para_style = element['paragraphMarker'].get('style', {})
+
+            # Filter for requested fields: alignment
+            if 'alignment' in para_style:
+                req = {
+                    'updateParagraphStyle': {
+                        'objectId': object_id,
+                        'textRange': {
+                            'type': 'FIXED_RANGE',
+                            'startIndex': current_index,
+                            'endIndex': current_index + text_len
+                        },
+                        'style': {'alignment': para_style['alignment']},
+                        'fields': 'alignment'
+                    }
+                }
+                if cell_location: req['updateParagraphStyle']['cellLocation'] = cell_location
+                requests.append(req)
+
+        # Advance our tracking index by the length of this element
+        current_index += text_len
+
+    return requests
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
@@ -659,13 +729,34 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             logging.debug(f"RAW REQUEST JSON (create + update): {json.dumps(create_request_body, indent=2)}")
 
-            # Apply basic text content (without styling update requests)
+            # Apply basic text content AND TEXT STYLING
             if element_type == 'shape' or element_type == 'table':
                 target_id = new_element_id
+
+                # Extract text object (robustly)
+                text_obj = None
                 if 'text' in master_element:
+                    text_obj = master_element['text']
+                elif element_type == 'shape' and 'text' in master_element.get('shape', {}):
+                    text_obj = master_element['shape']['text']
+
+                if text_obj:
+                    # 1. Insert Content (Structural Phase)
                     full_text = get_text_content_from_element(master_element)
+                    # Note: We strip() for insertion check, but for index alignment we might need raw text.
+                    # However, insertText usually works best with stripped input for shapes.
+                    # To match indices for styling, we rely on the fact that textElements cover the whole range.
+
                     if full_text.strip(): 
-                        structural_requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+                        # Use rstrip() to keep indentation if present but remove trailing newline which slides adds
+                        text_to_insert = full_text.rstrip('\n')
+                        structural_requests.append({'insertText': {'objectId': target_id, 'text': text_to_insert}})
+
+                        # 2. Apply Text Styling (Formatting Phase)
+                        # We only apply styling if content exists
+                        if 'textElements' in text_obj:
+                            style_reqs = generate_text_style_requests(target_id, text_obj['textElements'])
+                            formatting_requests.extend(style_reqs)
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
             
