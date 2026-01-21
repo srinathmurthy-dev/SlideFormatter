@@ -501,8 +501,10 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
 # --- COPY & SYNC LOGIC (WITH KEYWORD DEBUGGING) ---
 
 def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pres_id, dest_slide_id, master_slide_json, drive_service, docai_client, storage_client):
-    """Performs three-way synchronization (Delete/Add/Update)."""
-    requests = []
+    """Performs three-way synchronization (Delete/Add/Update). Returns (structural_requests, formatting_requests)."""
+    structural_requests = []
+    formatting_requests = []
+
     logging.info(f"Starting object synchronization for Slide ID: {dest_slide_id}")
     
     try:
@@ -511,7 +513,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         ).execute()
         dest_elements = dest_slide_json.get('pageElements', [])
     except HttpError as e:
-        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return []
+        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return [], []
 
     master_elements = master_slide_json.get('pageElements', [])
 
@@ -519,7 +521,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
     logging.debug(f"Phase 1: Checking {len(dest_elements)} destination elements for deletion.")
     for dest_element in dest_elements:
         if not find_master_match(dest_element, master_elements):
-            requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
+            structural_requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
 
     # PHASE 2 & 3: ADD NEW OR UPDATE EXISTING OBJECTS
     logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
@@ -612,7 +614,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             } if element_type == 'image' else {
                 'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
             }
-            requests.append(create_request_body)
+            structural_requests.append(create_request_body)
 
             # 2. Separate Update Request for Styling (with Field Mask)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
@@ -632,7 +634,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                             'fields': field_mask
                         }
                     }
-                    requests.append(update_request)
+                    formatting_requests.append(update_request)
 
             elif element_type == 'image' and 'imageProperties' in master_element['image']:
                 # STRICT FILTERING: Keep only 'outline' for images to avoid complex property errors.
@@ -650,7 +652,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                             'fields': field_mask
                         }
                     }
-                    requests.append(update_request)
+                    formatting_requests.append(update_request)
 
             # Note: createTable doesn't support tableProperties in create, and there is no single updateTableProperties request.
             # Table styling requires cell-level updates which are handled separately if needed.
@@ -663,12 +665,12 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                 if 'text' in master_element:
                     full_text = get_text_content_from_element(master_element)
                     if full_text.strip(): 
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+                        structural_requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
             
-    logging.info(f"Finished synchronization. Generated {len(requests)} batch requests.")
-    return requests
+    logging.info(f"Finished synchronization. Generated {len(structural_requests)} structural requests and {len(formatting_requests)} formatting requests.")
+    return structural_requests, formatting_requests
 
 # --- Helper Functions for Text/Table Processing ---
 
@@ -925,7 +927,8 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                     master_slide_id = master_slide['objectId']; dest_slide = dest_pres['slides'][i]; dest_slide_id = dest_slide['objectId']
                     
                     # Run Copy/Delete sync logic
-                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client) 
+                    # SPLIT EXECUTION: Structural (Create) and Formatting (Style) are now separate.
+                    struct_requests, fmt_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client)
                     
                     # Run validation logic on existing content in destination
                     dest_slide_elements = dest_slide.get('pageElements', [])
@@ -934,13 +937,26 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                     keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
                     GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
                     
-                    if copy_requests:
-                        logging.debug(f"Executing BatchUpdate with {len(copy_requests)} requests.")
+                    # EXECUTE PHASE 1: STRUCTURAL CHANGES (Critical)
+                    if struct_requests:
+                        logging.debug(f"Executing Structural BatchUpdate with {len(struct_requests)} requests.")
                         try:
-                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': copy_requests}).execute()
-                            logging.info(f"Applied {len(copy_requests)} batch updates to slide {i+1} successfully.")
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': struct_requests}).execute()
+                            logging.info(f"Applied {len(struct_requests)} structural updates to slide {i+1} successfully.")
                         except HttpError as e:
-                            logging.error(f"BatchUpdate failed on {dest_name}, slide {i+1}: {e}"); total_inconsistencies += 1
+                            logging.error(f"CRITICAL: Structural BatchUpdate failed on {dest_name}, slide {i+1}: {e}")
+                            total_inconsistencies += 1
+                            continue # Stop processing this slide if structure failed
+
+                    # EXECUTE PHASE 2: FORMATTING CHANGES (Non-Critical)
+                    if fmt_requests:
+                        logging.debug(f"Executing Formatting BatchUpdate with {len(fmt_requests)} requests.")
+                        try:
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': fmt_requests}).execute()
+                            logging.info(f"Applied {len(fmt_requests)} formatting updates to slide {i+1} successfully.")
+                        except HttpError as e:
+                            # Log error but continue (Partial Success)
+                            logging.error(f"WARNING: Formatting BatchUpdate failed on {dest_name}, slide {i+1}: {e}")
                     
                 except Exception as e:
                     logging.error(f"CRITICAL PARSING ERROR in Slide {i+1} of {dest_name}. Traceback: {e}"); total_inconsistencies += 1
