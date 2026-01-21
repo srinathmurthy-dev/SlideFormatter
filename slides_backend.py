@@ -340,77 +340,11 @@ def generate_field_mask(properties, parent_key=''):
 
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
 def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    """Generates UpdateTextStyle and UpdateParagraphStyle requests for specific text properties."""
-    requests = []
-
-    # Track current index
-    current_index = 0
-
-    for element in text_elements:
-        start_index = element.get('startIndex', 0)
-        end_index = element.get('endIndex', 0)
-
-        # Calculate range length
-        text_len = end_index - start_index
-        if text_len <= 0: continue
-
-        # --- 1. Text Style (Color, Font Size) ---
-        if 'textRun' in element:
-            text_style = element['textRun'].get('style', {})
-
-            # Filter for requested fields: foregroundColor, fontSize
-            update_style = {}
-            fields_mask = []
-
-            if 'foregroundColor' in text_style:
-                update_style['foregroundColor'] = text_style['foregroundColor']
-                fields_mask.append('foregroundColor')
-
-            if 'fontSize' in text_style:
-                update_style['fontSize'] = text_style['fontSize']
-                fields_mask.append('fontSize')
-
-            if update_style:
-                req = {
-                    'updateTextStyle': {
-                        'objectId': object_id,
-                        'textRange': {
-                            'type': 'FIXED_RANGE',
-                            'startIndex': current_index,
-                            'endIndex': current_index + text_len
-                        },
-                        'style': update_style,
-                        'fields': ",".join(fields_mask)
-                    }
-                }
-                if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
-                requests.append(req)
-
-        # --- 2. Paragraph Style (Alignment) ---
-        elif 'paragraphMarker' in element:
-            para_style = element['paragraphMarker'].get('style', {})
-
-            # Filter for requested fields: alignment
-            if 'alignment' in para_style:
-                req = {
-                    'updateParagraphStyle': {
-                        'objectId': object_id,
-                        'textRange': {
-                            'type': 'FIXED_RANGE',
-                            'startIndex': current_index,
-                            'endIndex': current_index + text_len
-                        },
-                        'style': {'alignment': para_style['alignment']},
-                        'fields': 'alignment'
-                    }
-                }
-                if cell_location: req['updateParagraphStyle']['cellLocation'] = cell_location
-                requests.append(req)
-
-        # Advance our tracking index by the length of this element
-        current_index += text_len
-
-    return requests
+    """
+    DISABLED FOR DEBUGGING: Returns empty list to isolate background color issues.
+    User requested to enable just the background color and copy over of the text.
+    """
+    return []
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
@@ -687,12 +621,11 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             # 2. Separate Update Request for Styling (with Field Mask)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                # STRICT FILTERING: Background Color, Borders, Vertical Alignment, and Autofit.
+                # STRICT FILTERING: Minimal Baseline (Background + Outline only).
+                # Removed 'contentAlignment' and 'autofit' to isolate background color issues.
                 full_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
 
-                # Add 'autofit' to ensure text sizing behavior matches master.
-                # Add 'shapeBackgroundFill' explicitly.
-                allowed_keys = {'shapeBackgroundFill', 'outline', 'contentAlignment', 'autofit'}
+                allowed_keys = {'shapeBackgroundFill', 'outline'}
                 cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
 
                 if cleaned_props:
