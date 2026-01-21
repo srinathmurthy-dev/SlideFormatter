@@ -353,7 +353,8 @@ def scrub_read_only_fields(properties):
         'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
         'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span', 
         'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
-        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
+        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform',
+        'type', 'renderedText'
     ]
     
     if isinstance(properties, dict):
@@ -615,7 +616,13 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             # 2. Separate Update Request for Styling (with Field Mask)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                cleaned_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+                # STRICT FILTERING: User requested only Background Color and Basic Content.
+                # We filter to keep only 'shapeBackgroundFill' and 'outline'.
+                full_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+
+                allowed_keys = {'shapeBackgroundFill', 'outline'}
+                cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
+
                 if cleaned_props:
                     field_mask = generate_field_mask(cleaned_props)
                     update_request = {
@@ -628,7 +635,12 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
                     requests.append(update_request)
 
             elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                cleaned_props = scrub_read_only_fields(master_element['image']['imageProperties'])
+                # STRICT FILTERING: Keep only 'outline' for images to avoid complex property errors.
+                full_props = scrub_read_only_fields(master_element['image']['imageProperties'])
+
+                allowed_keys = {'outline'}
+                cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
+
                 if cleaned_props:
                     field_mask = generate_field_mask(cleaned_props)
                     update_request = {
