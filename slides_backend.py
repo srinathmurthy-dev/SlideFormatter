@@ -339,7 +339,7 @@ def generate_field_mask(properties, parent_key=''):
 # ------------------------------
 
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
-def generate_text_style_requests(object_id, text_elements, cell_location=None):
+def generate_text_style_requests(object_id, text_elements, text_length_limit, cell_location=None):
     """Generates UpdateTextStyle requests for specific text properties (Font Size Only)."""
     requests = []
 
@@ -350,39 +350,77 @@ def generate_text_style_requests(object_id, text_elements, cell_location=None):
         start_index = element.get('startIndex', 0)
         end_index = element.get('endIndex', 0)
 
-        # Calculate range length
+        # Calculate range length based on master indices
         text_len = end_index - start_index
         if text_len <= 0: continue
 
-        # --- 1. Text Style (Font Size) ---
-        if 'textRun' in element:
-            text_style = element['textRun'].get('style', {})
+        # CLAMPING: Ensure we don't try to style beyond the destination text length
+        # The destination text might be shorter (e.g. if trailing newlines were stripped).
+        clamped_start = current_index
+        clamped_end = min(current_index + text_len, text_length_limit)
 
-            # Filter for requested fields: fontSize ONLY
-            update_style = {}
-            fields_mask = []
+        # If the start is already out of bounds, we stop processing (or skip this element)
+        if clamped_start >= text_length_limit:
+            break
 
-            if 'fontSize' in text_style:
-                update_style['fontSize'] = text_style['fontSize']
-                fields_mask.append('fontSize')
+        # If the range has length, generate request
+        if clamped_end > clamped_start:
 
-            if update_style:
-                req = {
-                    'updateTextStyle': {
-                        'objectId': object_id,
-                        'textRange': {
-                            'type': 'FIXED_RANGE',
-                            'startIndex': current_index,
-                            'endIndex': current_index + text_len
-                        },
-                        'style': update_style,
-                        'fields': ",".join(fields_mask)
+            # --- 1. Text Style (Font Size) ---
+            if 'textRun' in element:
+                text_style = element['textRun'].get('style', {})
+
+                # Filter for requested fields: fontSize ONLY
+                update_style = {}
+                fields_mask = []
+
+                if 'fontSize' in text_style:
+                    update_style['fontSize'] = text_style['fontSize']
+                    fields_mask.append('fontSize')
+
+                # Also restore foregroundColor as requested in previous turn but missed in the last revert
+                if 'foregroundColor' in text_style:
+                    update_style['foregroundColor'] = text_style['foregroundColor']
+                    fields_mask.append('foregroundColor')
+
+                if update_style:
+                    req = {
+                        'updateTextStyle': {
+                            'objectId': object_id,
+                            'textRange': {
+                                'type': 'FIXED_RANGE',
+                                'startIndex': clamped_start,
+                                'endIndex': clamped_end
+                            },
+                            'style': update_style,
+                            'fields': ",".join(fields_mask)
+                        }
                     }
-                }
-                if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
-                requests.append(req)
+                    if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
+                    requests.append(req)
 
-        # Advance our tracking index by the length of this element
+            # --- 2. Paragraph Style (Alignment) ---
+            # Re-enabling Alignment per user request history (it was disabled in minimal baseline but user asked for it)
+            elif 'paragraphMarker' in element:
+                para_style = element['paragraphMarker'].get('style', {})
+
+                if 'alignment' in para_style:
+                    req = {
+                        'updateParagraphStyle': {
+                            'objectId': object_id,
+                            'textRange': {
+                                'type': 'FIXED_RANGE',
+                                'startIndex': clamped_start,
+                                'endIndex': clamped_end
+                            },
+                            'style': {'alignment': para_style['alignment']},
+                            'fields': 'alignment'
+                        }
+                    }
+                    if cell_location: req['updateParagraphStyle']['cellLocation'] = cell_location
+                    requests.append(req)
+
+        # Advance our tracking index by the full length of this element (as mapped from Master)
         current_index += text_len
 
     return requests
@@ -726,7 +764,12 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
                         # 2. Apply Text Styling (Formatting Phase)
                         if 'textElements' in text_obj:
-                            style_reqs = generate_text_style_requests(target_id, text_obj['textElements'])
+                            # Calculate the effective length of the text in the destination.
+                            # Shape text always implicitly ends with a newline in Slides.
+                            # We inserted `text_to_insert`. The final length is len(text_to_insert) + 1.
+                            dest_text_length = len(text_to_insert) + 1
+
+                            style_reqs = generate_text_style_requests(target_id, text_obj['textElements'], dest_text_length)
                             formatting_requests.extend(style_reqs)
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
