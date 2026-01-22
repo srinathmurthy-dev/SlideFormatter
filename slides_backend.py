@@ -510,8 +510,16 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
             row_1_cells = table_rows[1]['tableCells']
             
             for c_idx in range(1, cols):
-                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
-                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
+                # Robust extraction: flatten newlines to spaces to capture multi-line headers
+                raw_p1 = get_text_content_from_element(row_0_cells[c_idx])
+                raw_p2 = get_text_content_from_element(row_1_cells[c_idx])
+
+                header_p1 = raw_p1.replace('\n', ' ').strip()
+                header_p2 = raw_p2.replace('\n', ' ').strip()
+
+                # Debug logging to diagnose empty headers
+                if not header_p1 and not header_p2:
+                    logging.debug(f"DEBUG_HEADER: Col {c_idx} empty. Raw P1='{repr(raw_p1)}', Raw P2='{repr(raw_p2)}'")
                 
                 # The combined header is the unique identifier (keyword)
                 combined_header = f"{header_p1} - {header_p2}" if header_p1 and header_p2 else header_p1 or header_p2 or f"[Empty Col Header {c_idx}]"
@@ -519,7 +527,7 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
 
         # Row Headers: Taken from Column 0 (starting from row 2, skipping 0 and 1)
         for r_idx in range(2, rows):
-            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row Header {r_idx}]")
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
 
     else: # Default/Format 1: Simple Header (Row 0/Col 0 Headers)
         # Format 1: Uses Row 0 (skipping col 0) for column headers, Column 0 (skipping row 0) for row headers
@@ -527,11 +535,11 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
         # Column Headers (Row 0, starting from column 1)
         if rows > 0:
             for c_idx in range(1, cols):
-                col_headers.append(get_text_content_from_element(table_rows[0]['tableCells'][c_idx]).strip() or f"[Empty Col Header {c_idx}]")
+                col_headers.append(get_text_content_from_element(table_rows[0]['tableCells'][c_idx]).replace('\n', ' ').strip() or f"[Empty Col Header {c_idx}]")
 
         # Row Headers (Column 0, starting from row 1)
         for r_idx in range(1, rows):
-            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row Header {r_idx}]")
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
 
     return row_headers, col_headers
 
