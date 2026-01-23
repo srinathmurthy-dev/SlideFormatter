@@ -40,6 +40,14 @@ table_format_dropdown = widgets.Dropdown(
     value='Format 1: Row 0/Col 0 Headers',
     description='Table Format:',
 )
+
+interpret_parentheses_checkbox = widgets.Checkbox(
+    value=True,
+    description='Interpret ()',
+    disabled=False,
+    indent=False
+)
+
 go_button = widgets.Button(description='Go', disabled=True)
 
 # 4. File Browsing Simulation
@@ -76,6 +84,7 @@ def on_go_clicked(b):
         master_url_input.value,
         destination_url_input.value,
         table_format_dropdown.value,
+        interpret_parentheses_checkbox.value,
         status_output  # Pass the widget for real-time updates
     )
 
@@ -97,6 +106,7 @@ def display_ui():
         widgets.HBox([master_url_input, file_picker("Master:", "Slides")]),
         widgets.HBox([destination_url_input, file_picker("Destination:", "Slides/Folder")]),
         table_format_dropdown,
+        interpret_parentheses_checkbox,
         go_button,
         widgets.Label(value="Status: Ready"),
         status_output

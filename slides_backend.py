@@ -313,31 +313,54 @@ def process_image_ocr(image_element, docai_client, storage_client):
 # --- UNIT CONVERSION HELPER ---
 EMU_PER_PT = 12700
 
-def _normalize_numeric_value(value_str):
+def _normalize_numeric_value(value_str, interpret_parentheses=True):
     """
     Normalizes a value string into a clean numeric format.
-    - Strips '$', '%', ',', and whitespace.
-    - Converts parentheses '(123)' into negative '-123'.
+    - Strips all non-numeric characters except digits, '.', and leading '-/+'.
+    - If interpret_parentheses is True, converts '(123)' into negative '-123'.
+    - If interpret_parentheses is False, '(123)' becomes '123' (positive).
     """
     if not value_str:
         return ""
 
     cleaned = value_str.strip()
 
-    # Check for parentheses indicating negative value
-    is_negative = False
-    if cleaned.startswith('(') and cleaned.endswith(')'):
-        is_negative = True
+    # 1. Handle Parentheses Logic
+    is_parenthesized = cleaned.startswith('(') and cleaned.endswith(')')
+    if is_parenthesized:
         cleaned = cleaned[1:-1] # Remove parens
+        if interpret_parentheses:
+            # Add negative sign if interpreting parens as negative
+            if not cleaned.strip().startswith('-'):
+                cleaned = '-' + cleaned
+        # Else: Just removed parens, treat as positive (unless explicit negative inside)
 
-    # Remove standard formatting symbols
-    cleaned = cleaned.replace('$', '').replace('%', '').replace(',', '').strip()
+    # 2. Strict Numeric Cleaning
+    # Remove everything that is NOT a digit, dot, or sign
+    # We'll re-construct the string char by char or regex
+    # Regex approach: Keep only [\d\.\-\+]
 
-    # Handle explicit negative sign if present
-    if is_negative and not cleaned.startswith('-'):
-        cleaned = '-' + cleaned
+    # However, signs should only be valid at the start.
+    # Simple pass:
+    #   - Remove symbols like $, %, ,
+    #   - Preserve the sign if it's the first relevant char
 
-    return cleaned
+    final_chars = []
+    has_digit_or_dot = False
+
+    for i, char in enumerate(cleaned):
+        if char.isdigit() or char == '.':
+            final_chars.append(char)
+            has_digit_or_dot = True
+        elif char in ('-', '+'):
+            # Keep sign only if we haven't seen a digit/dot yet (prefix sign)
+            if not has_digit_or_dot:
+                final_chars.append(char)
+                # Note: We don't set has_digit_or_dot here, allowing "-5" but not "5-2"
+        # Else: Ignore ($, %, comma, space, letters)
+
+    result = "".join(final_chars)
+    return result
 
 def convert_emu_to_pt(magnitude, original_unit):
     """Converts EMU magnitudes to PT. Returns magnitude and target unit ('PT')."""
@@ -867,7 +890,7 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
     return requests, metadata 
 
 
-def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers"):
+def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers", interpret_parentheses=True):
     """Processes text for keyword/value extraction and calculates fuzzy confidence."""
     metadata = []
     # FIX: Updated regex to capture dual values like -$30M (-3%)
@@ -919,8 +942,12 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                             value_match = VALUE_PATTERN.search(line)
                             
                             if value_match:
-                                value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
-                                numeric_val = _normalize_numeric_value(value)
+                                value = value_match.group(0) # Keep raw match for now
+
+                                # Legacy cleaning for 'value' display (optional, but good for readability)
+                                display_val = value.replace('(', '-').replace(')', '').replace('$', '').strip() if interpret_parentheses else value.replace('(', '').replace(')', '').replace('$', '').strip()
+
+                                numeric_val = _normalize_numeric_value(value, interpret_parentheses)
                                 conf = 1.0 # Max confidence since the structure is guaranteed
                                 
                                 # Combined Keyword Logic: "RowLabel: ColKeyword"
@@ -929,12 +956,12 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 # Add valid table data as keyword metadata
                                 metadata.append({
                                     'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                    'object_id': element_id, 'label': row_label, 'keyword': final_kw, 'value': value,
+                                    'object_id': element_id, 'label': row_label, 'keyword': final_kw, 'value': display_val,
                                     'numericValue': numeric_val,
                                     'confidence': conf
                                 })
 
-                                logging.info(f"TABLE_MATCH: {final_kw} Value='{value}' Numeric='{numeric_val}'")
+                                logging.info(f"TABLE_MATCH: {final_kw} Value='{display_val}' Numeric='{numeric_val}'")
                         
                     except Exception as e:
                         logging.error(f"TABLE_ERROR: Failed to process cell R:{r_idx}, C{c_idx}. Error: {e}")
@@ -1032,7 +1059,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 # Log and add DOLLAR entry (e.g., YoY -> YoY $)
                                 if value_dollar:
                                     final_kw = f"{base_keyword_display} $"
-                                    num_val = _normalize_numeric_value(value_dollar)
+                                    num_val = _normalize_numeric_value(value_dollar, interpret_parentheses)
                                     logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_dollar}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
@@ -1044,7 +1071,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 # Log and add PERCENT entry (e.g., YoY -> YoY %)
                                 if value_percent:
                                     final_kw = f"{base_keyword_display} %"
-                                    num_val = _normalize_numeric_value(value_percent)
+                                    num_val = _normalize_numeric_value(value_percent, interpret_parentheses)
                                     logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_percent}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
@@ -1056,16 +1083,20 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 # SINGLE VALUE CASE: Find standard value after keyword
                                 value_match = VALUE_PATTERN.search(line, search_start)
                                 if value_match:
-                                    value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
-                                    num_val = _normalize_numeric_value(value)
+                                    value = value_match.group(0) # Keep raw for display logic below
+
+                                    # Legacy display value cleaning
+                                    display_val = value.replace('(', '-').replace(')', '').replace('$', '').strip() if interpret_parentheses else value.replace('(', '').replace(')', '').replace('$', '').strip()
+
+                                    num_val = _normalize_numeric_value(value, interpret_parentheses)
                                     conf = round(best_confidence, 4)
                                     
                                     # LOGGING: Successful match
-                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{value}' Numeric='{num_val}' Confidence={conf:.4f} in Line {line_idx+1}")
+                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{display_val}' Numeric='{num_val}' Confidence={conf:.4f} in Line {line_idx+1}")
                                     
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': current_label, 'keyword': base_keyword_display, 'value': value,
+                                        'object_id': element_id, 'label': current_label, 'keyword': base_keyword_display, 'value': display_val,
                                         'numericValue': num_val,
                                         'confidence': conf
                                     })
@@ -1077,7 +1108,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
 
 # --- Main Execution Function (FULL DEFINITION IN BLOCK 2) ---
 
-def run_back_end(master_url, dest_id_or_url, table_format, status_output):
+def run_back_end(master_url, dest_id_or_url, table_format, interpret_parentheses, status_output):
     
     LOG_FILE_PLACEHOLDER = f"{LOG_FILENAME}" 
     
@@ -1136,7 +1167,7 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                     dest_slide_elements = dest_slide.get('pageElements', [])
                     
                     # Call validation using the table_format argument
-                    keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
+                    keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format, interpret_parentheses)
                     GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
                     
                     # EXECUTE PHASE 1: STRUCTURAL CHANGES (Critical)
