@@ -313,6 +313,32 @@ def process_image_ocr(image_element, docai_client, storage_client):
 # --- UNIT CONVERSION HELPER ---
 EMU_PER_PT = 12700
 
+def _normalize_numeric_value(value_str):
+    """
+    Normalizes a value string into a clean numeric format.
+    - Strips '$', '%', ',', and whitespace.
+    - Converts parentheses '(123)' into negative '-123'.
+    """
+    if not value_str:
+        return ""
+
+    cleaned = value_str.strip()
+
+    # Check for parentheses indicating negative value
+    is_negative = False
+    if cleaned.startswith('(') and cleaned.endswith(')'):
+        is_negative = True
+        cleaned = cleaned[1:-1] # Remove parens
+
+    # Remove standard formatting symbols
+    cleaned = cleaned.replace('$', '').replace('%', '').replace(',', '').strip()
+
+    # Handle explicit negative sign if present
+    if is_negative and not cleaned.startswith('-'):
+        cleaned = '-' + cleaned
+
+    return cleaned
+
 def convert_emu_to_pt(magnitude, original_unit):
     """Converts EMU magnitudes to PT. Returns magnitude and target unit ('PT')."""
     # The Slides API typically returns EMU, which must be converted to PT for CREATE/UPDATE requests.
@@ -529,6 +555,18 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
         for r_idx in range(2, rows):
             row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
 
+    elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+        # Format 3: Uses Row 1 (Index 1) for column headers. Row 0 is ignored.
+
+        # Column Headers (Row 1, starting from column 1)
+        if rows > 1:
+            for c_idx in range(1, cols):
+                col_headers.append(get_text_content_from_element(table_rows[1]['tableCells'][c_idx]).replace('\n', ' ').strip() or f"[Empty Col Header {c_idx}]")
+
+        # Row Headers (Column 0, starting from row 2)
+        for r_idx in range(2, rows):
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
+
     else: # Default/Format 1: Simple Header (Row 0/Col 0 Headers)
         # Format 1: Uses Row 0 (skipping col 0) for column headers, Column 0 (skipping row 0) for row headers
         
@@ -560,7 +598,11 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
     logging.debug(f"TABLE_HEADERS: Slide ID: {dest_slide_id}. Column Headers: {col_headers}")
 
     # Determine starting row for data cells
-    data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+    data_start_row = 1
+    if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
+        data_start_row = 2
+    elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+        data_start_row = 2
 
     # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
     for r_idx in range(data_start_row, rows):
@@ -836,7 +878,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
         element_type_key = next((k for k in element.keys() if k not in ['objectId', 'size', 'transform', 'elementProperties']), None)
 
         
-        # --- TABLE LOGIC CHECK (Handles Format 1 and 2) ---
+        # --- TABLE LOGIC CHECK (Handles Format 1, 2, and 3) ---
         if element_type_key == 'table':
             table_prop = element['table']
             table_rows = table_prop['tableRows']
@@ -849,7 +891,11 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
             row_headers, col_headers = _get_table_headers(element, table_format)
             
             # Determine starting row for data cells
-            data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+            data_start_row = 1
+            if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
+                data_start_row = 2
+            elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+                data_start_row = 2
 
             # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
             for r_idx in range(data_start_row, rows):
@@ -874,14 +920,21 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                             
                             if value_match:
                                 value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
+                                numeric_val = _normalize_numeric_value(value)
                                 conf = 1.0 # Max confidence since the structure is guaranteed
                                 
+                                # Combined Keyword Logic: "RowLabel: ColKeyword"
+                                final_kw = f"{row_label}: {col_keyword}"
+
                                 # Add valid table data as keyword metadata
                                 metadata.append({
                                     'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                    'object_id': element_id, 'label': row_label, 'keyword': col_keyword, 'value': value,
+                                    'object_id': element_id, 'label': row_label, 'keyword': final_kw, 'value': value,
+                                    'numericValue': numeric_val,
                                     'confidence': conf
                                 })
+
+                                logging.info(f"TABLE_MATCH: {final_kw} Value='{value}' Numeric='{numeric_val}'")
                         
                     except Exception as e:
                         logging.error(f"TABLE_ERROR: Failed to process cell R:{r_idx}, C{c_idx}. Error: {e}")
@@ -979,20 +1032,24 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 # Log and add DOLLAR entry (e.g., YoY -> YoY $)
                                 if value_dollar:
                                     final_kw = f"{base_keyword_display} $"
-                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_dollar}' Confidence={conf:.4f}")
+                                    num_val = _normalize_numeric_value(value_dollar)
+                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_dollar}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
                                         'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_dollar,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                                 
                                 # Log and add PERCENT entry (e.g., YoY -> YoY %)
                                 if value_percent:
                                     final_kw = f"{base_keyword_display} %"
-                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_percent}' Confidence={conf:.4f}")
+                                    num_val = _normalize_numeric_value(value_percent)
+                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_percent}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
                                         'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_percent,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                             else:
@@ -1000,14 +1057,16 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 value_match = VALUE_PATTERN.search(line, search_start)
                                 if value_match:
                                     value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
+                                    num_val = _normalize_numeric_value(value)
                                     conf = round(best_confidence, 4)
                                     
                                     # LOGGING: Successful match
-                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{value}' Confidence={conf:.4f} in Line {line_idx+1}")
+                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{value}' Numeric='{num_val}' Confidence={conf:.4f} in Line {line_idx+1}")
                                     
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
                                         'object_id': element_id, 'label': current_label, 'keyword': base_keyword_display, 'value': value,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                                 

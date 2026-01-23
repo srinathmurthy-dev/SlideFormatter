@@ -32,7 +32,11 @@ destination_url_input = widgets.Text(
     value='https://docs.google.com/presentation/d/1CLNSV1AQELkm3fiTBB5bTGGYrZNpPWnuhBWccLbJ9r4'
 )
 table_format_dropdown = widgets.Dropdown(
-    options=['Format 1: Row 0/Col 0 Headers', 'Format 2: Dual Header (Rows 0 & 1 Combined)'],
+    options=[
+        'Format 1: Row 0/Col 0 Headers',
+        'Format 2: Dual Header (Rows 0 & 1 Combined)',
+        'Format 3: Row 1/Col 0 Headers (Row 0 Ignored)'
+    ],
     value='Format 1: Row 0/Col 0 Headers',
     description='Table Format:',
 )
