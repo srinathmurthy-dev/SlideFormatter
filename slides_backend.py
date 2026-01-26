@@ -248,7 +248,7 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, docai_client, storage_client):
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
@@ -258,36 +258,26 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
         # CRITICAL DEBUGGING PRINTS
         logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
         logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
         
-        # 1. Download image data using the reliable Slides API thumbnail method
-        image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
+        # 1. Download image data directly from contentUrl (Robust Method)
+        # The contentUrl is valid for ~30 minutes and does not require a separate API call to getThumbnail.
+        thumbnail_url = image_element.get('image', {}).get('contentUrl')
         
-        # Get the credentials for authenticated request
-        creds = slides_service._http.credentials
-        
-        # Request the thumbnail URL for the specific image element within the presentation
-        response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id, 
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id, 
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
-        ).execute()
+        if not thumbnail_url:
+            logging.warning("OCR_WARNING: No contentUrl found in image element. Skipping.")
+            return ""
 
-        thumbnail_url = response.get('contentUrl')
-        logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
+        logging.debug(f"OCR_STEP: Found contentUrl: {thumbnail_url[:80]}...")
         
-        # Use authenticated credentials to perform an HTTP GET request
-        response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
+        # Download the image directly
+        response = requests.get(thumbnail_url)
         
         if response.status_code == 200:
             image_bytes = response.content
-            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via contentUrl.")
         else:
-            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
-            return extracted_text # Return empty text if download fails
+            logging.error(f"OCR_ERROR: Failed to download image from contentUrl. Status: {response.status_code}.")
+            return extracted_text
 
         # 2. Upload to GCS
         bucket = storage_client.bucket(GCS_BUCKET_NAME); blob = bucket.blob(temp_filename)
@@ -323,6 +313,55 @@ def process_image_ocr(image_element, drive_service, docai_client, storage_client
 # --- UNIT CONVERSION HELPER ---
 EMU_PER_PT = 12700
 
+def _normalize_numeric_value(value_str, interpret_parentheses=True):
+    """
+    Normalizes a value string into a clean numeric format.
+    - Strips all non-numeric characters except digits, '.', and leading '-/+'.
+    - If interpret_parentheses is True, converts '(123)' into negative '-123'.
+    - If interpret_parentheses is False, '(123)' becomes '123' (positive).
+    """
+    if not value_str:
+        return ""
+
+    cleaned = value_str.strip()
+
+    # 1. Handle Parentheses Logic
+    is_parenthesized = cleaned.startswith('(') and cleaned.endswith(')')
+    if is_parenthesized:
+        cleaned = cleaned[1:-1] # Remove parens
+        if interpret_parentheses:
+            # Add negative sign if interpreting parens as negative
+            if not cleaned.strip().startswith('-'):
+                cleaned = '-' + cleaned
+        # Else: Just removed parens, treat as positive (unless explicit negative inside)
+
+    # 2. Strict Numeric Cleaning
+    # Remove everything that is NOT a digit, dot, or sign
+    # We'll re-construct the string char by char or regex
+    # Regex approach: Keep only [\d\.\-\+]
+
+    # However, signs should only be valid at the start.
+    # Simple pass:
+    #   - Remove symbols like $, %, ,
+    #   - Preserve the sign if it's the first relevant char
+
+    final_chars = []
+    has_digit_or_dot = False
+
+    for i, char in enumerate(cleaned):
+        if char.isdigit() or char == '.':
+            final_chars.append(char)
+            has_digit_or_dot = True
+        elif char in ('-', '+'):
+            # Keep sign only if we haven't seen a digit/dot yet (prefix sign)
+            if not has_digit_or_dot:
+                final_chars.append(char)
+                # Note: We don't set has_digit_or_dot here, allowing "-5" but not "5-2"
+        # Else: Ignore ($, %, comma, space, letters)
+
+    result = "".join(final_chars)
+    return result
+
 def convert_emu_to_pt(magnitude, original_unit):
     """Converts EMU magnitudes to PT. Returns magnitude and target unit ('PT')."""
     # The Slides API typically returns EMU, which must be converted to PT for CREATE/UPDATE requests.
@@ -332,9 +371,108 @@ def convert_emu_to_pt(magnitude, original_unit):
     return magnitude, original_unit
 # ------------------------------
 
+# --- HELPER: GENERATE FIELD MASK ---
+def generate_field_mask(properties, parent_key=''):
+    """Generates a comma-separated field mask from a dictionary of properties."""
+    paths = []
+    for key, value in properties.items():
+        # Handle snake_case to camelCase mapping if keys are mixed, but usually properties are camelCase.
+        # Here we assume the input dictionary keys exactly match the API field names.
+        current_path = f"{parent_key}.{key}" if parent_key else key
+        if isinstance(value, dict):
+             # Recursively generate paths for nested dictionaries
+            paths.append(generate_field_mask(value, current_path))
+        else:
+            paths.append(current_path)
+    return ",".join(paths)
+# ------------------------------
+
 # --- NEW HELPER: GENERATE GRANULAR TEXT STYLE REQUESTS (BASELINE) ---
-def generate_text_style_requests(object_id, text_elements, cell_location=None):
-    return []
+def generate_text_style_requests(object_id, text_elements, text_length_limit, cell_location=None):
+    """Generates UpdateTextStyle requests for specific text properties (Font Size Only)."""
+    requests = []
+
+    # Track current index
+    current_index = 0
+
+    for element in text_elements:
+        start_index = element.get('startIndex', 0)
+        end_index = element.get('endIndex', 0)
+
+        # Calculate range length based on master indices
+        text_len = end_index - start_index
+        if text_len <= 0: continue
+
+        # CLAMPING: Ensure we don't try to style beyond the destination text length
+        # The destination text might be shorter (e.g. if trailing newlines were stripped).
+        clamped_start = current_index
+        clamped_end = min(current_index + text_len, text_length_limit)
+
+        # If the start is already out of bounds, we stop processing (or skip this element)
+        if clamped_start >= text_length_limit:
+            break
+
+        # If the range has length, generate request
+        if clamped_end > clamped_start:
+
+            # --- 1. Text Style (Font Size) ---
+            if 'textRun' in element:
+                text_style = element['textRun'].get('style', {})
+
+                # Filter for requested fields: fontSize ONLY
+                update_style = {}
+                fields_mask = []
+
+                if 'fontSize' in text_style:
+                    update_style['fontSize'] = text_style['fontSize']
+                    fields_mask.append('fontSize')
+
+                # Also restore foregroundColor as requested in previous turn but missed in the last revert
+                if 'foregroundColor' in text_style:
+                    update_style['foregroundColor'] = text_style['foregroundColor']
+                    fields_mask.append('foregroundColor')
+
+                if update_style:
+                    req = {
+                        'updateTextStyle': {
+                            'objectId': object_id,
+                            'textRange': {
+                                'type': 'FIXED_RANGE',
+                                'startIndex': clamped_start,
+                                'endIndex': clamped_end
+                            },
+                            'style': update_style,
+                            'fields': ",".join(fields_mask)
+                        }
+                    }
+                    if cell_location: req['updateTextStyle']['cellLocation'] = cell_location
+                    requests.append(req)
+
+            # --- 2. Paragraph Style (Alignment) ---
+            # Re-enabling Alignment per user request history (it was disabled in minimal baseline but user asked for it)
+            elif 'paragraphMarker' in element:
+                para_style = element['paragraphMarker'].get('style', {})
+
+                if 'alignment' in para_style:
+                    req = {
+                        'updateParagraphStyle': {
+                            'objectId': object_id,
+                            'textRange': {
+                                'type': 'FIXED_RANGE',
+                                'startIndex': clamped_start,
+                                'endIndex': clamped_end
+                            },
+                            'style': {'alignment': para_style['alignment']},
+                            'fields': 'alignment'
+                        }
+                    }
+                    if cell_location: req['updateParagraphStyle']['cellLocation'] = cell_location
+                    requests.append(req)
+
+        # Advance our tracking index by the full length of this element (as mapped from Master)
+        current_index += text_len
+
+    return requests
 # --------------------------------------------------------
 
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
@@ -347,7 +485,8 @@ def scrub_read_only_fields(properties):
         'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
         'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span', 
         'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
-        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
+        'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform',
+        'type', 'renderedText'
     ]
     
     if isinstance(properties, dict):
@@ -392,11 +531,10 @@ def get_text_content_from_element(element):
             if 'textRun' in text_element:
                 full_text += text_element['textRun'].get('content', '')
             elif 'paragraphMarker' in text_element:
-                # Append newline to simulate structure breaks
-                if full_text and not full_text.endswith('\n'):
-                     full_text += '\n'
+                # Always append newline for paragraph markers to maintain index parity with API
+                full_text += '\n'
                          
-    return full_text.strip()
+    return full_text
 # -----------------------------------------------------------------------
 
 
@@ -421,8 +559,16 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
             row_1_cells = table_rows[1]['tableCells']
             
             for c_idx in range(1, cols):
-                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
-                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
+                # Robust extraction: flatten newlines to spaces to capture multi-line headers
+                raw_p1 = get_text_content_from_element(row_0_cells[c_idx])
+                raw_p2 = get_text_content_from_element(row_1_cells[c_idx])
+
+                header_p1 = raw_p1.replace('\n', ' ').strip()
+                header_p2 = raw_p2.replace('\n', ' ').strip()
+
+                # Debug logging to diagnose empty headers
+                if not header_p1 and not header_p2:
+                    logging.debug(f"DEBUG_HEADER: Col {c_idx} empty. Raw P1='{repr(raw_p1)}', Raw P2='{repr(raw_p2)}'")
                 
                 # The combined header is the unique identifier (keyword)
                 combined_header = f"{header_p1} - {header_p2}" if header_p1 and header_p2 else header_p1 or header_p2 or f"[Empty Col Header {c_idx}]"
@@ -430,7 +576,19 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
 
         # Row Headers: Taken from Column 0 (starting from row 2, skipping 0 and 1)
         for r_idx in range(2, rows):
-            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row Header {r_idx}]")
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
+
+    elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+        # Format 3: Uses Row 1 (Index 1) for column headers. Row 0 is ignored.
+
+        # Column Headers (Row 1, starting from column 1)
+        if rows > 1:
+            for c_idx in range(1, cols):
+                col_headers.append(get_text_content_from_element(table_rows[1]['tableCells'][c_idx]).replace('\n', ' ').strip() or f"[Empty Col Header {c_idx}]")
+
+        # Row Headers (Column 0, starting from row 2)
+        for r_idx in range(2, rows):
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
 
     else: # Default/Format 1: Simple Header (Row 0/Col 0 Headers)
         # Format 1: Uses Row 0 (skipping col 0) for column headers, Column 0 (skipping row 0) for row headers
@@ -438,11 +596,11 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
         # Column Headers (Row 0, starting from column 1)
         if rows > 0:
             for c_idx in range(1, cols):
-                col_headers.append(get_text_content_from_element(table_rows[0]['tableCells'][c_idx]).strip() or f"[Empty Col Header {c_idx}]")
+                col_headers.append(get_text_content_from_element(table_rows[0]['tableCells'][c_idx]).replace('\n', ' ').strip() or f"[Empty Col Header {c_idx}]")
 
         # Row Headers (Column 0, starting from row 1)
         for r_idx in range(1, rows):
-            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).strip() or f"[Empty Row Header {r_idx}]")
+            row_headers.append(get_text_content_from_element(table_rows[r_idx]['tableCells'][0]).replace('\n', ' ').strip() or f"[Empty Row Header {r_idx}]")
 
     return row_headers, col_headers
 
@@ -463,7 +621,11 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
     logging.debug(f"TABLE_HEADERS: Slide ID: {dest_slide_id}. Column Headers: {col_headers}")
 
     # Determine starting row for data cells
-    data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+    data_start_row = 1
+    if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
+        data_start_row = 2
+    elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+        data_start_row = 2
 
     # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
     for r_idx in range(data_start_row, rows):
@@ -494,8 +656,10 @@ def extract_table_data_for_debug(table_element, dest_slide_id, table_format="For
 # --- COPY & SYNC LOGIC (WITH KEYWORD DEBUGGING) ---
 
 def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pres_id, dest_slide_id, master_slide_json, drive_service, docai_client, storage_client):
-    """Performs three-way synchronization (Delete/Add/Update)."""
-    requests = []
+    """Performs three-way synchronization (Delete/Add/Update). Returns (structural_requests, formatting_requests)."""
+    structural_requests = []
+    formatting_requests = []
+
     logging.info(f"Starting object synchronization for Slide ID: {dest_slide_id}")
     
     try:
@@ -504,7 +668,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         ).execute()
         dest_elements = dest_slide_json.get('pageElements', [])
     except HttpError as e:
-        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return []
+        logging.error(f"Could not read destination slide {dest_slide_id}. Error: {e}"); return [], []
 
     master_elements = master_slide_json.get('pageElements', [])
 
@@ -512,7 +676,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
     logging.debug(f"Phase 1: Checking {len(dest_elements)} destination elements for deletion.")
     for dest_element in dest_elements:
         if not find_master_match(dest_element, master_elements):
-            requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
+            structural_requests.append({'deleteObject': {'objectId': dest_element['objectId']}}); logging.debug(f"ACTION: DELETE object {dest_element['objectId']} (not found in master).")
 
     # PHASE 2 & 3: ADD NEW OR UPDATE EXISTING OBJECTS
     logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
@@ -570,8 +734,8 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
         # --------------------------------------------------------------------------------
         if element_type == 'image':
             logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
+            # The function is invoked here! (Updated signature)
+            extracted_text = process_image_ocr(master_element, docai_client, storage_client)
             
             if extracted_text:
                 logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
@@ -597,7 +761,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             new_element_id = uuid.uuid4().hex
             logging.debug(f"ACTION: ADD new object {new_element_id} of type {element_type}.")
 
-            # Creation Request Body
+            # 1. Base Creation Request (WITHOUT STYLING PROPERTIES)
             create_request_body = {
                 'createShape': {'objectId': new_element_id, 'shapeType': master_element['shape'].get('shapeType', 'TEXT_BOX'), 'elementProperties': element_properties}
             } if element_type == 'shape' else {
@@ -605,30 +769,86 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             } if element_type == 'image' else {
                 'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
             }
-            
-            # Apply styling properties as SIBLINGS (Standard REST structure)
-            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
-                create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
-            elif element_type == 'image' and 'imageProperties' in master_element['image']:
-                create_request_body['createImage']['imageProperties'] = scrub_read_only_fields(master_element['image']['imageProperties'])
-            elif element_type == 'table' and 'tableProperties' in master_element['table']:
-                create_request_body['createTable']['tableProperties'] = scrub_read_only_fields(master_element['table']['tableProperties'])
+            structural_requests.append(create_request_body)
 
-            logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
-            requests.append(create_request_body)
-            
-            # Apply basic text content (without styling update requests)
+            # 2. Separate Update Request for Styling (with Field Mask)
+            if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
+                # STRICT FILTERING: Minimal Baseline (Background + Outline only).
+                # Removed 'contentAlignment' and 'autofit' to isolate background color issues.
+                full_props = scrub_read_only_fields(master_element['shape']['shapeProperties'])
+
+                allowed_keys = {'shapeBackgroundFill', 'outline'}
+                cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
+
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateShapeProperties': {
+                            'objectId': new_element_id,
+                            'shapeProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    formatting_requests.append(update_request)
+
+            elif element_type == 'image' and 'imageProperties' in master_element['image']:
+                # STRICT FILTERING: Keep only 'outline' for images to avoid complex property errors.
+                full_props = scrub_read_only_fields(master_element['image']['imageProperties'])
+
+                allowed_keys = {'outline'}
+                cleaned_props = {k: v for k, v in full_props.items() if k in allowed_keys}
+
+                if cleaned_props:
+                    field_mask = generate_field_mask(cleaned_props)
+                    update_request = {
+                        'updateImageProperties': {
+                            'objectId': new_element_id,
+                            'imageProperties': cleaned_props,
+                            'fields': field_mask
+                        }
+                    }
+                    formatting_requests.append(update_request)
+
+            # Note: createTable doesn't support tableProperties in create, and there is no single updateTableProperties request.
+            # Table styling requires cell-level updates which are handled separately if needed.
+
+            logging.debug(f"RAW REQUEST JSON (create + update): {json.dumps(create_request_body, indent=2)}")
+
+            # Apply basic text content AND TEXT STYLING
             if element_type == 'shape' or element_type == 'table':
                 target_id = new_element_id
+
+                # Extract text object (robustly)
+                text_obj = None
                 if 'text' in master_element:
+                    text_obj = master_element['text']
+                elif element_type == 'shape' and 'text' in master_element.get('shape', {}):
+                    text_obj = master_element['shape']['text']
+
+                if text_obj:
+                    # 1. Insert Content (Structural Phase)
                     full_text = get_text_content_from_element(master_element)
+
                     if full_text.strip(): 
-                        requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
+                        # Use rstrip() to remove the final newline (which the new shape already has implicitly),
+                        # but keep all other formatting (leading spaces, internal newlines) to match indices.
+                        text_to_insert = full_text.rstrip('\n')
+                        structural_requests.append({'insertText': {'objectId': target_id, 'text': text_to_insert}})
+
+                        # 2. Apply Text Styling (Formatting Phase)
+                        if 'textElements' in text_obj:
+                            # Calculate the effective length of the text in the destination.
+                            # Shape text always implicitly ends with a newline in Slides.
+                            # We inserted `text_to_insert`. The final length is len(text_to_insert) + 1.
+                            dest_text_length = len(text_to_insert) + 1
+
+                            style_reqs = generate_text_style_requests(target_id, text_obj['textElements'], dest_text_length)
+                            formatting_requests.extend(style_reqs)
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
             
-    logging.info(f"Finished synchronization. Generated {len(requests)} batch requests.")
-    return requests
+    logging.info(f"Finished synchronization. Generated {len(structural_requests)} structural requests and {len(formatting_requests)} formatting requests.")
+    return structural_requests, formatting_requests
 
 # --- Helper Functions for Text/Table Processing ---
 
@@ -670,7 +890,7 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
     return requests, metadata 
 
 
-def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers"):
+def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers", interpret_parentheses=True):
     """Processes text for keyword/value extraction and calculates fuzzy confidence."""
     metadata = []
     # FIX: Updated regex to capture dual values like -$30M (-3%)
@@ -681,7 +901,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
         element_type_key = next((k for k in element.keys() if k not in ['objectId', 'size', 'transform', 'elementProperties']), None)
 
         
-        # --- TABLE LOGIC CHECK (Handles Format 1 and 2) ---
+        # --- TABLE LOGIC CHECK (Handles Format 1, 2, and 3) ---
         if element_type_key == 'table':
             table_prop = element['table']
             table_rows = table_prop['tableRows']
@@ -694,7 +914,11 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
             row_headers, col_headers = _get_table_headers(element, table_format)
             
             # Determine starting row for data cells
-            data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
+            data_start_row = 1
+            if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
+                data_start_row = 2
+            elif table_format == "Format 3: Row 1/Col 0 Headers (Row 0 Ignored)":
+                data_start_row = 2
 
             # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
             for r_idx in range(data_start_row, rows):
@@ -718,15 +942,26 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                             value_match = VALUE_PATTERN.search(line)
                             
                             if value_match:
-                                value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
+                                value = value_match.group(0) # Keep raw match for now
+
+                                # Legacy cleaning for 'value' display (optional, but good for readability)
+                                display_val = value.replace('(', '-').replace(')', '').replace('$', '').strip() if interpret_parentheses else value.replace('(', '').replace(')', '').replace('$', '').strip()
+
+                                numeric_val = _normalize_numeric_value(value, interpret_parentheses)
                                 conf = 1.0 # Max confidence since the structure is guaranteed
                                 
+                                # Combined Keyword Logic: "RowLabel: ColKeyword"
+                                final_kw = f"{row_label}: {col_keyword}"
+
                                 # Add valid table data as keyword metadata
                                 metadata.append({
                                     'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                    'object_id': element_id, 'label': row_label, 'keyword': col_keyword, 'value': value,
+                                    'object_id': element_id, 'label': row_label, 'keyword': final_kw, 'value': display_val,
+                                    'numericValue': numeric_val,
                                     'confidence': conf
                                 })
+
+                                logging.info(f"TABLE_MATCH: {final_kw} Value='{display_val}' Numeric='{numeric_val}'")
                         
                     except Exception as e:
                         logging.error(f"TABLE_ERROR: Failed to process cell R:{r_idx}, C{c_idx}. Error: {e}")
@@ -756,8 +991,12 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                     best_term = ""
 
                     for term in search_terms:
-                        # Fuzzy matching logic
-                        confidence = fuzz.partial_ratio(term.lower(), line.lower()) / 100.0
+                        # Optimization: Check for exact substring match first (Fast)
+                        if term.lower() in line.lower():
+                            confidence = 1.0
+                        else:
+                            # Fuzzy matching logic (Slower)
+                            confidence = fuzz.partial_ratio(term.lower(), line.lower()) / 100.0
                         
                         # LOGGING: Report every score
                         logging.debug(f"   MATCH_ATTEMPT: Slide ID: {dest_slide_id}. Line {line_idx+1}: '{line.strip()[:30]}...' -> Term '{term}' Score: {confidence:.4f}")
@@ -769,16 +1008,40 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                     if best_confidence >= KEYWORD_CONFIDENCE_THRESHOLD:
                         
                         # --- DUAL-VALUE LOGIC CHECK ---
-                        # If the keyword does NOT end with '$' or '%', assume it's the combined dual value.
                         is_dual_value = not (best_term.endswith('$') or best_term.endswith('%'))
                         
                         # Find the actual keyword match location to anchor the value search
-                        anchor_match = re.search(r'\b(' + re.escape(best_term) + r'|' + re.escape(alias) + r')\s*[:\s]*', line, re.IGNORECASE)
+                        # Use simple string finding if regex fails or for speed
+                        match_start_index = line.lower().find(best_term.lower())
                         
-                        if anchor_match:
-                            # Start value search just after the keyword/colon
-                            match_end_index = anchor_match.end(); search_start = min(match_end_index, len(line))
-                            
+                        if match_start_index != -1:
+                            match_end_index = match_start_index + len(best_term)
+                            search_start = min(match_end_index, len(line))
+
+                            # Adjust search start if followed by colon/space (manual regex equivalent)
+                            while search_start < len(line) and line[search_start] in (':', ' '):
+                                search_start += 1
+
+                            # --- PREFIX/LABEL EXTRACTION ---
+                            # Capture text preceding the match (e.g., "Play Consumers: Y/Y" -> "Play Consumers")
+                            prefix_text = line[:match_start_index].strip()
+
+                            # Clean the prefix (remove trailing colons)
+                            prefix_label = prefix_text.rstrip(':').strip()
+
+                            logging.debug(f"   PREFIX_DEBUG: Line='{line.strip()}' MatchIdx={match_start_index} Prefix='{prefix_label}'")
+
+                            # Construct the final display keyword
+                            # If a prefix exists, combine it: "Play Consumers: Y/Y"
+                            # Otherwise, stick to the base keyword.
+                            # We update 'product_area_label' to reflect this prefix for the metadata 'label' field too.
+                            if prefix_label:
+                                base_keyword_display = f"{prefix_label}: {keyword}"
+                                current_label = prefix_label
+                            else:
+                                base_keyword_display = keyword
+                                current_label = product_area_label
+
                             if is_dual_value:
                                 # DUAL VALUE CASE: Capture the rest of the line as the dual value
                                 value = line[search_start:].strip()
@@ -795,34 +1058,46 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
                                 
                                 # Log and add DOLLAR entry (e.g., YoY -> YoY $)
                                 if value_dollar:
-                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{keyword} $' Value='{value_dollar}' Confidence={conf:.4f}")
+                                    final_kw = f"{base_keyword_display} $"
+                                    num_val = _normalize_numeric_value(value_dollar, interpret_parentheses)
+                                    logging.info(f"   KEYWORD_FOUND (Dual-$): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_dollar}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': f"{keyword} $", 'value': value_dollar,
+                                        'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_dollar,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                                 
                                 # Log and add PERCENT entry (e.g., YoY -> YoY %)
                                 if value_percent:
-                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{keyword} %' Value='{value_percent}' Confidence={conf:.4f}")
+                                    final_kw = f"{base_keyword_display} %"
+                                    num_val = _normalize_numeric_value(value_percent, interpret_parentheses)
+                                    logging.info(f"   KEYWORD_FOUND (Dual-%): Slide ID: {dest_slide_id}. Keyword='{final_kw}' Value='{value_percent}' Numeric='{num_val}' Confidence={conf:.4f}")
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': f"{keyword} %", 'value': value_percent,
+                                        'object_id': element_id, 'label': current_label, 'keyword': final_kw, 'value': value_percent,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                             else:
                                 # SINGLE VALUE CASE: Find standard value after keyword
                                 value_match = VALUE_PATTERN.search(line, search_start)
                                 if value_match:
-                                    value = value_match.group(0).replace('(', '-').replace(')', '').replace('$', '').strip()
+                                    value = value_match.group(0) # Keep raw for display logic below
+
+                                    # Legacy display value cleaning
+                                    display_val = value.replace('(', '-').replace(')', '').replace('$', '').strip() if interpret_parentheses else value.replace('(', '').replace(')', '').replace('$', '').strip()
+
+                                    num_val = _normalize_numeric_value(value, interpret_parentheses)
                                     conf = round(best_confidence, 4)
                                     
                                     # LOGGING: Successful match
-                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{keyword}' Value='{value}' Confidence={conf:.4f} in Line {line_idx+1}")
+                                    logging.info(f"   KEYWORD_FOUND: Slide ID: {dest_slide_id}. Keyword='{base_keyword_display}' Value='{display_val}' Numeric='{num_val}' Confidence={conf:.4f} in Line {line_idx+1}")
                                     
                                     metadata.append({
                                         'type': 'Keyword', 'dest_id': dest_pres_id, 'page_id': dest_slide_id, 
-                                        'object_id': element_id, 'label': product_area_label, 'keyword': keyword, 'value': value,
+                                        'object_id': element_id, 'label': current_label, 'keyword': base_keyword_display, 'value': display_val,
+                                        'numericValue': num_val,
                                         'confidence': conf
                                     })
                                 
@@ -833,7 +1108,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
 
 # --- Main Execution Function (FULL DEFINITION IN BLOCK 2) ---
 
-def run_back_end(master_url, dest_id_or_url, table_format, status_output):
+def run_back_end(master_url, dest_id_or_url, table_format, interpret_parentheses, status_output):
     
     LOG_FILE_PLACEHOLDER = f"{LOG_FILENAME}" 
     
@@ -885,22 +1160,36 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                     master_slide_id = master_slide['objectId']; dest_slide = dest_pres['slides'][i]; dest_slide_id = dest_slide['objectId']
                     
                     # Run Copy/Delete sync logic
-                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client) 
+                    # SPLIT EXECUTION: Structural (Create) and Formatting (Style) are now separate.
+                    struct_requests, fmt_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client)
                     
                     # Run validation logic on existing content in destination
                     dest_slide_elements = dest_slide.get('pageElements', [])
                     
                     # Call validation using the table_format argument
-                    keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
+                    keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format, interpret_parentheses)
                     GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
                     
-                    if copy_requests:
-                        logging.debug(f"Executing BatchUpdate with {len(copy_requests)} requests.")
+                    # EXECUTE PHASE 1: STRUCTURAL CHANGES (Critical)
+                    if struct_requests:
+                        logging.debug(f"Executing Structural BatchUpdate with {len(struct_requests)} requests.")
                         try:
-                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': copy_requests}).execute()
-                            logging.info(f"Applied {len(copy_requests)} batch updates to slide {i+1} successfully.")
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': struct_requests}).execute()
+                            logging.info(f"Applied {len(struct_requests)} structural updates to slide {i+1} successfully.")
                         except HttpError as e:
-                            logging.error(f"BatchUpdate failed on {dest_name}, slide {i+1}: {e}"); total_inconsistencies += 1
+                            logging.error(f"CRITICAL: Structural BatchUpdate failed on {dest_name}, slide {i+1}: {e}")
+                            total_inconsistencies += 1
+                            continue # Stop processing this slide if structure failed
+
+                    # EXECUTE PHASE 2: FORMATTING CHANGES (Non-Critical)
+                    if fmt_requests:
+                        logging.debug(f"Executing Formatting BatchUpdate with {len(fmt_requests)} requests.")
+                        try:
+                            slides_service.presentations().batchUpdate(presentationId=dest_id, body={'requests': fmt_requests}).execute()
+                            logging.info(f"Applied {len(fmt_requests)} formatting updates to slide {i+1} successfully.")
+                        except HttpError as e:
+                            # Log error but continue (Partial Success)
+                            logging.error(f"WARNING: Formatting BatchUpdate failed on {dest_name}, slide {i+1}: {e}")
                     
                 except Exception as e:
                     logging.error(f"CRITICAL PARSING ERROR in Slide {i+1} of {dest_name}. Traceback: {e}"); total_inconsistencies += 1
