@@ -233,7 +233,7 @@ def find_master_match(element1, element2_list):
     
     # Skip matching check for placeholder elements (e.g., slide titles, footers)
     if w1 == 0 and h1 == 0 and not element1.get('shape'): return True
-    
+
     for element2 in element2_list:
         w2, h2, x2, y2 = get_element_metrics(element2)
         
@@ -248,55 +248,40 @@ def find_master_match(element1, element2_list):
 
 # --- Document AI Processing ---
 
-def process_image_ocr(image_element, drive_service, docai_client, storage_client, slides_service, dest_pres_id): # Signature updated
+def process_image_ocr(image_element, docai_client, storage_client):
+    """Downloads image via contentUrl (no API call) and processes via DocAI."""
     logging.debug("OCR_START: Starting Document AI OCR processing for image element.")
     temp_filename = f"temp_image_{uuid.uuid4().hex[:8]}.png"
     extracted_text = ""
     blob = None
-    
-    try:
-        # CRITICAL DEBUGGING PRINTS
-        logging.debug(f"OCR_DEBUG: Full Element Keys: {list(image_element.keys())}")
-        logging.debug(f"OCR_DEBUG: Element ID (objectId): {image_element.get('objectId')}")
-        logging.debug(f"OCR_DEBUG: Attempting to access parentObjectId: {image_element.get('parentObjectId')}")
-        
-        # 1. Download image data using the reliable Slides API thumbnail method
-        image_obj_id = image_element['objectId']
-        logging.debug(f"OCR_STEP: Requesting image thumbnail for object ID: {image_obj_id} in Presentation ID: {dest_pres_id}")
-        
-        # Get the credentials for authenticated request
-        creds = slides_service._http.credentials
-        
-        # Request the thumbnail URL for the specific image element within the presentation
-        response = slides_service.presentations().pages().getThumbnail(
-            presentationId=dest_pres_id, 
-            pageObjectId=image_element.get('parentObjectId', image_obj_id), # Use safe access
-            elementId=image_obj_id, 
-            thumbnailProperties={'thumbnailSize': 'LARGE', 'mimeType': 'PNG'}
-        ).execute()
 
-        thumbnail_url = response.get('contentUrl')
-        logging.debug(f"OCR_STEP: Received thumbnail URL: {thumbnail_url[:80]}...")
-        
-        # Use authenticated credentials to perform an HTTP GET request
-        response = requests.get(thumbnail_url, headers={'Authorization': 'Bearer ' + creds.token})
+    try:
+        # 1. Get Image Content URL directly from element properties
+        image_url = image_element.get('image', {}).get('contentUrl')
+        if not image_url:
+            logging.warning("OCR_SKIPPED: No contentUrl found in image element.")
+            return ""
+
+        logging.debug(f"OCR_STEP: Downloading image from contentUrl...")
+
+        # Download the image (contentUrl is typically a signed, short-lived public URL)
+        response = requests.get(image_url)
         
         if response.status_code == 200:
             image_bytes = response.content
-            logging.debug(f"OCR_STEP: Successfully downloaded image bytes via authenticated URL.")
+            logging.debug(f"OCR_STEP: Successfully downloaded image bytes.")
         else:
-            # THIS IS THE PATH THAT GENERATED THE 404/403 (Authentication/Permissions failure)
-            logging.error(f"OCR_ERROR: Failed to download image from URL. Status: {response.status_code}. (Check Drive/Slides API scopes and file sharing on the presentation).")
-            return extracted_text # Return empty text if download fails
+            logging.error(f"OCR_ERROR: Failed to download image from contentUrl. Status: {response.status_code}.")
+            return ""
 
         # 2. Upload to GCS
         bucket = storage_client.bucket(GCS_BUCKET_NAME); blob = bucket.blob(temp_filename)
         blob.upload_from_string(image_bytes, content_type='image/png')
         logging.info(f"OCR_STEP: Image uploaded to GCS: {GCS_BUCKET_NAME}/{temp_filename}")
 
-        # 3. Process via Document AI 
+        # 3. Process via Document AI
         image = documentai.RawDocument(content=image_bytes, mime_type="image/png")
-        processor_name = docai_client.processor_path(GCP_PROJECT_ID, "us", DOC_AI_PROCESSOR_ID) 
+        processor_name = docai_client.processor_path(GCP_PROJECT_ID, "us", DOC_AI_PROCESSOR_ID)
         
         request = documentai.ProcessRequest(name=processor_name, raw_document=image)
         response = docai_client.process_document(request=request)
@@ -340,22 +325,22 @@ def generate_text_style_requests(object_id, text_elements, cell_location=None):
 # --- SCRUBBING FUNCTION: Removes known read-only fields (AGGRESSIVE) ---
 def scrub_read_only_fields(properties):
     """Recursively removes known read-only fields from a dictionary."""
-    
+
     # Aggressive list of fields that cause 'Invalid field mask' errors
     READ_ONLY_FIELDS = [
-        'placeholder', 'placeholderId', 'parentObjectId', 'propertyState', 
+        'placeholder', 'placeholderId', 'parentObjectId', 'propertyState',
         'fontScale', 'lineSpacingReduction', 'text', 'size', 'elementProperties',
-        'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span', 
+        'content', 'tableRange', 'tableGrid', 'columnIndex', 'rowIndex', 'span',
         'columnSpan', 'rowSpan', 'textRun', 'paragraphMarker', 'transform', 'autoFit',
         'isPlaceholder', 'id', 'source', 'kind', 'parentTextRange', 'resolvedSize', 'resolvedTransform'
     ]
-    
+
     if isinstance(properties, dict):
         new_properties = {}
         for key, value in properties.items():
             # Convert key to snake_case for comparison (to catch both)
             snake_key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
-            
+
             if snake_key not in READ_ONLY_FIELDS and key not in READ_ONLY_FIELDS:
                 if isinstance(value, (dict, list)):
                     new_properties[key] = scrub_read_only_fields(value)
@@ -413,19 +398,31 @@ def _get_table_headers(table_element, table_format="Format 1: Row 0/Col 0 Header
     col_headers = []
 
     if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)":
-        # Format 2: Combines Row 0 and Row 1 text for column header labels (e.g., 'Q3 - Actual')
-        
-        # Column Headers: Combine Row 0 and Row 1 content (skipping cell 0,0 and 1,0)
+        # Format 2: Combines Row 0 and Row 1 text for column header labels
+        # PLUS uses Row 2, Col 1 (Index 1, 0) as a global prefix.
+
+        prefix = ""
+        # Safety check for sufficient rows
+        if rows >= 2:
+            try:
+                # Get prefix from Row 2, Column 1 (Index 1, Index 0)
+                prefix = get_text_content_from_element(table_rows[1]['tableCells'][0]).split('\n')[0].strip()
+            except Exception:
+                pass
+
         if rows >= 2:
             row_0_cells = table_rows[0]['tableCells']
             row_1_cells = table_rows[1]['tableCells']
             
             for c_idx in range(1, cols):
-                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip()
-                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip()
+                header_p1 = get_text_content_from_element(row_0_cells[c_idx]).split('\n')[0].strip() # Row Index 0
+                header_p2 = get_text_content_from_element(row_1_cells[c_idx]).split('\n')[0].strip() # Row Index 1
+
+                # Format: "{Prefix}, {Row 1 Header}, {Row 0 Header}"
+                # Filter out empty strings
+                parts = [p for p in [prefix, header_p2, header_p1] if p]
+                combined_header = ", ".join(parts) if parts else f"[Empty Col Header {c_idx}]"
                 
-                # The combined header is the unique identifier (keyword)
-                combined_header = f"{header_p1} - {header_p2}" if header_p1 and header_p2 else header_p1 or header_p2 or f"[Empty Col Header {c_idx}]"
                 col_headers.append(combined_header)
 
         # Row Headers: Taken from Column 0 (starting from row 2, skipping 0 and 1)
@@ -517,17 +514,17 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
     # PHASE 2 & 3: ADD NEW OR UPDATE EXISTING OBJECTS
     logging.debug(f"Phase 2 & 3: Checking {len(master_elements)} master elements for addition/update.")
     for master_element in master_elements:
-        
+
         # --- CORRECTLY DETERMINE element_type ---
         element_id = master_element['objectId']
         TYPE_KEYS = ('objectId', 'size', 'transform') # Keys to ignore when finding the type
-        
+
         element_type = None
         for key in master_element.keys():
             if key not in TYPE_KEYS:
                 element_type = key # e.g., 'shape', 'image', 'table'
                 break
-                
+
         if not element_type:
             logging.warning(f"UNHANDLED: Could not determine type for object ID {element_id}. Skipping.")
             continue
@@ -535,21 +532,21 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
         # Existence Check - See if the master element already exists in the destination
         matching_dest_id = find_master_match(master_element, dest_elements) # Define variable
-        
+
         # --- DIMENSIONAL CONVERSION AND UNIT ENFORCEMENT ---
         # *** INITIALIZE element_properties BEFORE USE ***
-        element_properties = {'pageObjectId': dest_slide_id} 
-        
+        element_properties = {'pageObjectId': dest_slide_id}
+
         master_size = copy.deepcopy(master_element.get('size', {}))
         if master_size:
             if master_size.get('width'):
                 mag, unit = convert_emu_to_pt(master_size['width'].get('magnitude', 0), master_size['width'].get('unit', 'EMU'))
                 master_size['width']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['width']['unit'] = 'PT' 
+                master_size['width']['unit'] = 'PT'
             if master_size.get('height'):
                 mag, unit = convert_emu_to_pt(master_size['height'].get('magnitude', 0), master_size['height'].get('unit', 'EMU'))
                 master_size['height']['magnitude'] = round(mag, 3) # Rounding for cleaner JSON
-                master_size['height']['unit'] = 'PT' 
+                master_size['height']['unit'] = 'PT'
 
         master_transform = copy.deepcopy(master_element.get('transform', {}))
         if master_transform:
@@ -559,23 +556,23 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             if 'translateY' in master_transform:
                 master_transform['translateY'], _ = convert_emu_to_pt(master_transform['translateY'], 'EMU')
                 master_transform['translateY'] = round(master_transform['translateY'], 3)
-            master_transform['unit'] = 'PT' 
-        
+            master_transform['unit'] = 'PT'
+
         if master_size and (master_size.get('width') or master_size.get('height')): element_properties['size'] = master_size
         if master_transform and ('translateX' in master_transform or 'translateY' in master_transform or 'unit' in master_transform): element_properties['transform'] = master_transform
 
-        
+
         # --------------------------------------------------------------------------------
         # FIX: OCR CALL INTEGRATION (Guaranteed execution path for images)
         # --------------------------------------------------------------------------------
         if element_type == 'image':
             logging.debug(f"OCR_ACTION: BEGIN processing image element {element_id}.")
-            # The function is invoked here! (Now with the required slides_service and dest_pres_id)
-            extracted_text = process_image_ocr(master_element, drive_service, docai_client, storage_client, slides_service, dest_slide_id)
-            
+            # The function is invoked here! (Now using contentUrl, so no extra service args needed)
+            extracted_text = process_image_ocr(master_element, docai_client, storage_client)
+
             if extracted_text:
                 logging.info(f"OCR_RESULT: Text found ({len(extracted_text)} chars). Adding to validation metadata.")
-                
+
                 # Append the extracted text as a shape/text-element structure for validation processing
                 # We use the current hardcoded format string for this standalone validation call
                 keyword_metadata = process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, [{'text': {'textElements': [{'textRun': {'content': extracted_text}}]}}], "Format 1: Row 0/Col 0 Headers")
@@ -589,7 +586,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             # --- ACTION: UPDATE EXISTING OBJECT (Skipped in this baseline) ---
             target_id = matching_dest_id
             logging.debug(f"ACTION: SKIP existing object {target_id} of type {element_type}. (Skipping update for now)")
-            
+
             GLOBAL_METADATA['SlideID_Object'][target_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
 
         else:
@@ -605,7 +602,7 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
             } if element_type == 'image' else {
                 'createTable': {'objectId': new_element_id, 'rows': master_element['table']['rows'], 'columns': master_element['table']['columns'], 'elementProperties': element_properties}
             }
-            
+
             # Apply styling properties as SIBLINGS (Standard REST structure)
             if element_type == 'shape' and 'shapeProperties' in master_element['shape']:
                 create_request_body['createShape']['shapeProperties'] = scrub_read_only_fields(master_element['shape']['shapeProperties'])
@@ -616,17 +613,17 @@ def copy_slide_content(slides_service, master_slide_id, master_pres_id, dest_pre
 
             logging.debug(f"RAW REQUEST JSON (createShape): {json.dumps(create_request_body, indent=2)}")
             requests.append(create_request_body)
-            
+
             # Apply basic text content (without styling update requests)
             if element_type == 'shape' or element_type == 'table':
                 target_id = new_element_id
                 if 'text' in master_element:
                     full_text = get_text_content_from_element(master_element)
-                    if full_text.strip(): 
+                    if full_text.strip():
                         requests.append({'insertText': {'objectId': target_id, 'text': full_text.strip()}})
 
             GLOBAL_METADATA['SlideID_Object'][new_element_id] = {'type': element_type.capitalize(), 'dest_id': dest_pres_id, 'page_id': dest_slide_id}
-            
+
     logging.info(f"Finished synchronization. Generated {len(requests)} batch requests.")
     return requests
 
@@ -643,22 +640,22 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
                 # Extract text content from the master element cell
                 cell = table_prop['tableRows'][r_idx]['tableCells'][c_idx]; cell_content = get_text_content_from_element(cell).strip()
                 
-                if cell_content: 
+                if cell_content:
                     # 1. Delete existing text (clean cell for insert)
-                    delete_text_request = { 
+                    delete_text_request = {
                         'deleteText': {
-                            'objectId': table_id, 
+                            'objectId': table_id,
                             'cellLocation': {'rowIndex': r_idx, 'columnIndex': c_idx},
-                            'textRange': {'type': 'ALL'} 
+                            'textRange': {'type': 'ALL'}
                         }
                     }
                     requests.append(delete_text_request)
-                    
+
                     # 2. Insert new text
                     insert_text_request = {
                         'insertText': {
-                            'objectId': table_id, 
-                            'cellLocation': {'rowIndex': r_idx, 'columnIndex': c_idx}, 
+                            'objectId': table_id,
+                            'cellLocation': {'rowIndex': r_idx, 'columnIndex': c_idx},
                             'text': cell_content
                         }
                     }
@@ -667,7 +664,7 @@ def process_table_for_replication(table_id, dest_pres_id, dest_slide_id, table_e
             except Exception as e:
                 logging.warning(f"Error parsing table cell {r_idx},{c_idx}: {e}")
     logging.debug("Completed table content parsing.")
-    return requests, metadata 
+    return requests, metadata
 
 
 def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, page_elements, table_format="Format 1: Row 0/Col 0 Headers"):
@@ -694,6 +691,7 @@ def process_text_bearing_objects(slides_service, dest_pres_id, dest_slide_id, pa
             row_headers, col_headers = _get_table_headers(element, table_format)
             
             # Determine starting row for data cells
+            # For Format 2: Data starts at Row 3 (Index 2)
             data_start_row = 2 if table_format == "Format 2: Dual Header (Rows 0 & 1 Combined)" else 1
 
             # Iterate through Data Cells (Starting from the determined data_start_row, column 1)
@@ -885,15 +883,15 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                     master_slide_id = master_slide['objectId']; dest_slide = dest_pres['slides'][i]; dest_slide_id = dest_slide['objectId']
                     
                     # Run Copy/Delete sync logic
-                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client) 
+                    copy_requests = copy_slide_content(slides_service, master_slide_id, master_id, dest_id, dest_slide_id, master_slide, drive_service, docai_client, storage_client)
                     
                     # Run validation logic on existing content in destination
                     dest_slide_elements = dest_slide.get('pageElements', [])
-                    
+
                     # Call validation using the table_format argument
                     keyword_metadata = process_text_bearing_objects(slides_service, dest_id, dest_slide_id, dest_slide_elements, table_format)
                     GLOBAL_METADATA['Keyword_Values'].extend(keyword_metadata)
-                    
+
                     if copy_requests:
                         logging.debug(f"Executing BatchUpdate with {len(copy_requests)} requests.")
                         try:
@@ -901,7 +899,7 @@ def run_back_end(master_url, dest_id_or_url, table_format, status_output):
                             logging.info(f"Applied {len(copy_requests)} batch updates to slide {i+1} successfully.")
                         except HttpError as e:
                             logging.error(f"BatchUpdate failed on {dest_name}, slide {i+1}: {e}"); total_inconsistencies += 1
-                    
+
                 except Exception as e:
                     logging.error(f"CRITICAL PARSING ERROR in Slide {i+1} of {dest_name}. Traceback: {e}"); total_inconsistencies += 1
                     continue
